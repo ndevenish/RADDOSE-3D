@@ -10,6 +10,8 @@ import java.sql.Statement;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
+import java.util.Objects;
+
 /**
  * Provides high level functions for access to a database to store, organize,
  * queue and retrieve RADDOSE-3D jobs.
@@ -126,8 +128,11 @@ public class DatabaseConnector {
       conn = null;
     }
 
+    String hostname = Objects.requireNonNullElse(System.getenv("MYSQL_HOSTNAME"), "localhost");
+
+
     try {
-      conn = DriverManager.getConnection("jdbc:mysql://localhost/raddose?"
+      conn = DriverManager.getConnection("jdbc:mysql://" + hostname + "/raddose?"
           + "user=" + connUser + "&password=" + connPass);
     } catch (SQLException s) {
       // Catch one exception, try backing off 30 seconds
@@ -136,7 +141,7 @@ public class DatabaseConnector {
       } catch (InterruptedException i) {
         // ignore
       }
-      conn = DriverManager.getConnection("jdbc:mysql://localhost/raddose?"
+      conn = DriverManager.getConnection("jdbc:mysql://" + hostname + "/raddose?"
           + "user=" + connUser + "&password=" + connPass);
     }
     lock.unlock();

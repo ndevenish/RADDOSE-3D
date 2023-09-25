@@ -6,6 +6,8 @@ import java.sql.SQLException;
 import java.util.Iterator;
 import java.util.Vector;
 
+import java.util.Objects;
+
 /**
  * Server for batch processing of RADDOSE-3D jobs.
  */
@@ -55,7 +57,10 @@ public final class RaddoseServer {
 
     DatabaseConnector sql = new DatabaseConnector();
     try {
-      sql.connect("root", "raddose");
+      sql.connect(
+        Objects.requireNonNullElse(System.getenv("MYSQL_USERNAME"), "root"),
+        Objects.requireNonNullElse(System.getenv("MYSQL_PASSWORD"), "raddose")
+      );
     } catch (SQLException e) {
       System.err.println("Exception while connecting to SQL database: " + e);
       return;
