@@ -1,0 +1,472 @@
+"""
+Grammar-based and mutation-based input generators for RADDOSE-3D fuzzing.
+
+Cost model: normalized so insulin_test.txt ≈ 1.0.
+GrammarGenerator retries until estimated cost <= budget.
+MutationGenerator perturbs numeric fields in existing seed text.
+"""
+
+import math
+import random
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+FIXTURES_DIR = Path(__file__).parent.parent / "raddose3d" / "tests" / "fixtures"
+
+# ---------------------------------------------------------------------------
+# Cost model — normalized so insulin_test.txt ≈ 1.0 (Java ~12s)
+#
+# Calibration measurements (Java, aarch64):
+#   insulin_test:  ~12s   → 125k voxels × 180 angle-steps = 22.5M units
+#   mc_test:      ~583s   → 125k voxels × 9 steps + 1e7 electrons MC
+#                           base≈0.6s, MC overhead≈582s
+#                           → ~31 units per simulated electron (not 0.7)
+#   xfel_test:    ~268s   → 125 voxels × 1 step, ExposureTime=1s
+#                           XFEL cost ≈ voxels × ExposureTime × 4M units/s
+#                           → XFEL_PER_VOXEL_PER_SECOND ≈ 0.178 (normalized)
+#   microed_test:  ~1s    → tiny; MICROED_MULTIPLIER kept small
+# ---------------------------------------------------------------------------
+INSULIN_BASE_COST = 22_500_000.0
+MC_COST_PER_ELECTRON = 31.0      # work units per simulated electron (measured)
+XFEL_PER_VOXEL_PER_SECOND = 0.178  # normalized cost per voxel per second of exposure
+MICROED_MULTIPLIER = 2.0
+DEFAULT_BUDGET = 2.0             # ~2x insulin ≈ 24s Java max
+
+
+@dataclass
+class Config:
+    # Crystal geometry
+    crystal_type: str = "Cuboid"   # Cuboid | Cylinder | Spherical | Polyhedron
+    dim_x: float = 100.0
+    dim_y: float = 100.0
+    dim_z: float = 100.0
+    pixels_per_micron: float = 0.5
+
+    # Absorption coefficient mode
+    coefcalc: str = "RD3D"   # RD3D | SMALLMOLE | CIF | SAXSseq | MicroED
+
+    # Standard protein composition (RD3D / MicroED)
+    unit_cell_a: float = 78.0
+    unit_cell_b: float = 78.0
+    unit_cell_c: float = 78.0
+    num_monomers: int = 24
+    num_residues: int = 51
+    num_rna: int = 0
+    num_dna: int = 0
+    heavy_protein_atoms: str = ""      # e.g. "Zn 0.333 S 6"
+    solvent_heavy_conc: str = ""       # e.g. "P 425"
+    solvent_fraction: float = 0.64
+
+    # Small-molecule composition (SMALLMOLE)
+    small_mole_atoms: str = "Mg O 3"
+
+    # CIF mode
+    cif: str = "Fe3O4"
+
+    # SAXS mode
+    seq_file: str = ""
+    protein_conc: float = 2.0
+    saxs_container: bool = False
+    container_elements: str = "Si 1 O 2"
+    container_thickness: float = 50.0
+    container_density: float = 2.648
+
+    # Dose decay model
+    ddm: str = "Simple"        # Simple | Linear | Leal | Bfactor
+    gamma_param: float = 0.5
+    b0_param: float = 1.0
+    beta_param: float = 0.1    # must be positive (Gumbel-sign issue)
+
+    # Subprogram
+    subprogram: str = ""        # "" | MONTECARLO | XFEL | EMSP
+    runs: int = 1
+    sim_electrons: int = 1_000_000
+    calculate_pe_escape: bool = False
+    calculate_fl_escape: bool = False
+
+    # Beam
+    beam_type: str = "Gaussian"   # Gaussian | Tophat
+    flux: float = 2e12
+    fwhm_x: float = 100.0
+    fwhm_y: float = 100.0
+    energy: float = 12.1
+    collimation_x: float = 100.0
+    collimation_y: float = 100.0
+    collimation_type: str = "Rectangular"   # Rectangular | Circular
+    pulse_energy: float = 2e-6              # XFEL only
+
+    # Wedge
+    wedge_start: float = 0.0
+    wedge_end: float = 360.0
+    exposure_time: float = 100.0
+    angular_resolution: float = 2.0
+
+
+def estimate_cost(cfg: Config) -> float:
+    """Return cost relative to insulin_test.txt (≈ 1.0)."""
+    ppm3 = cfg.pixels_per_micron ** 3
+    if cfg.crystal_type == "Cuboid":
+        voxels = cfg.dim_x * cfg.dim_y * cfg.dim_z * ppm3
+    elif cfg.crystal_type == "Cylinder":
+        r = cfg.dim_y / 2.0
+        voxels = math.pi * r * r * cfg.dim_x * ppm3
+    elif cfg.crystal_type == "Spherical":
+        r = cfg.dim_x / 2.0
+        voxels = (4.0 / 3.0) * math.pi * r * r * r * ppm3
+    else:  # Polyhedron
+        voxels = cfg.dim_x * cfg.dim_y * cfg.dim_z * ppm3
+    voxels = min(voxels, 1_000_000)  # Java auto-caps at 1M
+
+    span = abs(cfg.wedge_end - cfg.wedge_start)
+    steps = max(1.0, span / cfg.angular_resolution) if span > 0 else 1.0
+    base = voxels * steps
+
+    if cfg.subprogram == "MONTECARLO":
+        mc = cfg.runs * cfg.sim_electrons * MC_COST_PER_ELECTRON
+        return (base + mc) / INSULIN_BASE_COST
+    elif cfg.subprogram == "XFEL":
+        # XFEL_PER_VOXEL_PER_SECOND is already normalized (= ratio/voxels),
+        # so no further division by INSULIN_BASE_COST needed.
+        return voxels * cfg.exposure_time * XFEL_PER_VOXEL_PER_SECOND * max(1, cfg.runs)
+    elif cfg.subprogram == "EMSP":
+        return base * MICROED_MULTIPLIER / INSULIN_BASE_COST
+    else:
+        return base / INSULIN_BASE_COST
+
+
+def render(cfg: Config) -> str:
+    """Render a Config to RADDOSE-3D input file text."""
+    lines = ["Crystal"]
+    lines.append(f"Type {cfg.crystal_type}")
+
+    if cfg.crystal_type == "Cuboid":
+        lines.append(f"Dimensions {cfg.dim_x} {cfg.dim_y} {cfg.dim_z}")
+    elif cfg.crystal_type == "Cylinder":
+        lines.append(f"Dimensions {cfg.dim_x} {cfg.dim_y}")
+    elif cfg.crystal_type == "Spherical":
+        lines.append(f"Dimensions {cfg.dim_x}")
+    elif cfg.crystal_type == "Polyhedron":
+        lines.append(f"Wireframetype obj")
+        lines.append(f"ModelFile {FIXTURES_DIR / 'cube.obj'}")
+
+    lines.append(f"PixelsPerMicron {cfg.pixels_per_micron}")
+    lines.append(f"AbsCoefCalc {cfg.coefcalc}")
+
+    if cfg.coefcalc in ("RD3D", "MicroED"):
+        lines.append(f"UnitCell {cfg.unit_cell_a} {cfg.unit_cell_b} {cfg.unit_cell_c}")
+        lines.append(f"NumMonomers {cfg.num_monomers}")
+        lines.append(f"NumResidues {cfg.num_residues}")
+        if cfg.num_rna > 0:
+            lines.append(f"NumRNA {cfg.num_rna}")
+        if cfg.num_dna > 0:
+            lines.append(f"NumDNA {cfg.num_dna}")
+        if cfg.heavy_protein_atoms:
+            lines.append(f"ProteinHeavyAtoms {cfg.heavy_protein_atoms}")
+        if cfg.solvent_heavy_conc:
+            lines.append(f"SolventHeavyConc {cfg.solvent_heavy_conc}")
+        if cfg.coefcalc == "RD3D":
+            lines.append(f"SolventFraction {cfg.solvent_fraction}")
+    elif cfg.coefcalc == "SMALLMOLE":
+        lines.append(f"UnitCell {cfg.unit_cell_a} {cfg.unit_cell_b} {cfg.unit_cell_c}")
+        lines.append(f"SmallMoleAtoms {cfg.small_mole_atoms}")
+        lines.append(f"NumMonomers {cfg.num_monomers}")
+    elif cfg.coefcalc == "CIF":
+        lines.append(f"CIF {cfg.cif}")
+    elif cfg.coefcalc == "SAXSseq":
+        lines.append(f"SeqFile {cfg.seq_file}")
+        lines.append(f"ProteinConc {cfg.protein_conc}")
+        if cfg.saxs_container:
+            lines.append(f"ContainerMaterialType elemental")
+            lines.append(f"MaterialElements {cfg.container_elements}")
+            lines.append(f"ContainerThickness {cfg.container_thickness}")
+            lines.append(f"ContainerDensity {cfg.container_density}")
+
+    if cfg.ddm != "Simple":
+        lines.append(f"DDM {cfg.ddm}")
+        if cfg.ddm in ("Leal", "Bfactor"):
+            lines.append(f"DecayParam {cfg.gamma_param} {cfg.b0_param} {cfg.beta_param}")
+
+    if cfg.subprogram:
+        lines.append(f"Subprogram {cfg.subprogram}")
+        if cfg.subprogram == "MONTECARLO":
+            lines.append(f"Runs {cfg.runs}")
+            lines.append(f"SimElectrons {cfg.sim_electrons}")
+            if cfg.calculate_pe_escape:
+                lines.append("CalculatePEEscape TRUE")
+            if cfg.calculate_fl_escape:
+                lines.append("CalculateFLEscape TRUE")
+        elif cfg.subprogram == "XFEL":
+            lines.append(f"Runs {cfg.runs}")
+
+    lines.append("")
+    lines.append("Beam")
+    lines.append(f"Type {cfg.beam_type}")
+    lines.append(f"Energy {cfg.energy}")
+
+    if cfg.subprogram != "EMSP":
+        lines.append(f"Flux {cfg.flux:.3e}")
+
+    if cfg.beam_type == "Gaussian":
+        lines.append(f"FWHM {cfg.fwhm_x} {cfg.fwhm_y}")
+
+    lines.append(f"Collimation {cfg.collimation_type} {cfg.collimation_x} {cfg.collimation_y}")
+
+    if cfg.subprogram == "XFEL":
+        lines.append(f"PulseEnergy {cfg.pulse_energy:.3e}")
+
+    lines.append("")
+    lines.append(f"Wedge {cfg.wedge_start} {cfg.wedge_end}")
+    lines.append(f"ExposureTime {cfg.exposure_time}")
+    lines.append(f"AngularResolution {cfg.angular_resolution}")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Grammar-based generator
+# ---------------------------------------------------------------------------
+
+class GrammarGenerator:
+    """
+    Samples random valid configs from the grammar.
+    Retries until estimated_cost(config) <= budget.
+    Feature flags (subprogram, PE/FL escape, container, DDM, etc.) are
+    sampled categorically so all combinations are reachable.
+    """
+
+    def __init__(self, budget: float = DEFAULT_BUDGET, rng: Optional[random.Random] = None):
+        self.budget = budget
+        self.rng = rng or random.Random()
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _u(self, lo: float, hi: float) -> float:
+        return self.rng.uniform(lo, hi)
+
+    def _i(self, lo: int, hi: int) -> int:
+        return self.rng.randint(lo, hi)
+
+    def _c(self, seq):
+        return self.rng.choice(seq)
+
+    def _flip(self, p: float = 0.5) -> bool:
+        return self.rng.random() < p
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def generate(self, max_retries: int = 200) -> Config:
+        for _ in range(max_retries):
+            cfg = self._sample()
+            if estimate_cost(cfg) <= self.budget:
+                return cfg
+        return self._minimal_fallback()
+
+    # ------------------------------------------------------------------
+    # Sampling
+    # ------------------------------------------------------------------
+
+    def _sample(self) -> Config:
+        cfg = Config()
+
+        # ---- Subprogram (controls major simulation mode) ----
+        cfg.subprogram = self._c(["", "", "", "", "MONTECARLO", "XFEL", "EMSP"])
+
+        # ---- Crystal type ----
+        if cfg.subprogram == "EMSP":
+            cfg.crystal_type = "Cuboid"
+        else:
+            cfg.crystal_type = self._c(["Cuboid", "Cuboid", "Cuboid",
+                                         "Cylinder", "Spherical", "Polyhedron"])
+
+        # ---- CoefCalc (must match crystal type and subprogram) ----
+        if cfg.subprogram == "EMSP":
+            cfg.coefcalc = "MicroED"
+        elif cfg.crystal_type == "Cylinder":
+            cfg.coefcalc = "SAXSseq"
+        elif cfg.crystal_type == "Polyhedron":
+            cfg.coefcalc = "RD3D"
+        else:
+            cfg.coefcalc = self._c(["RD3D", "RD3D", "RD3D", "SMALLMOLE", "CIF"])
+
+        # ---- Crystal dimensions ----
+        if cfg.crystal_type == "Cuboid":
+            cfg.dim_x = round(self._u(5, 300), 2)
+            cfg.dim_y = round(self._u(5, 300), 2)
+            cfg.dim_z = round(self._u(5, 300), 2)
+        elif cfg.crystal_type == "Cylinder":
+            cfg.dim_x = round(self._u(200, 3000), 1)   # height
+            cfg.dim_y = round(self._u(100, 2000), 1)   # diameter
+            cfg.dim_z = cfg.dim_y
+        elif cfg.crystal_type == "Spherical":
+            d = round(self._u(5, 300), 2)
+            cfg.dim_x = cfg.dim_y = cfg.dim_z = d
+        else:  # Polyhedron — cube.obj defines geometry, dims are ignored
+            cfg.dim_x = cfg.dim_y = cfg.dim_z = 30.0
+
+        # ---- PixelsPerMicron (major cost driver — keep within budget) ----
+        if cfg.crystal_type == "Cylinder":
+            cfg.pixels_per_micron = self._c([0.005, 0.01, 0.02, 0.05])
+        elif cfg.coefcalc == "SMALLMOLE":
+            # Small molecules are tiny; needs high ppm
+            cfg.pixels_per_micron = self._c([1.0, 2.0, 5.0])
+        else:
+            cfg.pixels_per_micron = self._c([0.1, 0.2, 0.5, 1.0, 2.0])
+
+        # ---- Composition ----
+        if cfg.coefcalc in ("RD3D", "MicroED"):
+            cfg.unit_cell_a = round(self._u(20, 200), 2)
+            cfg.unit_cell_b = round(self._u(20, 200), 2)
+            cfg.unit_cell_c = round(self._u(20, 200), 2)
+            cfg.num_monomers = self._i(1, 48)
+            cfg.num_residues = self._i(20, 500)
+            cfg.num_rna = self._i(0, 5) if self._flip(0.1) else 0
+            cfg.num_dna = self._i(0, 5) if self._flip(0.1) else 0
+            cfg.solvent_fraction = round(self._u(0.3, 0.85), 4)
+            cfg.heavy_protein_atoms = self._c(["", "Zn 0.333 S 6", "Fe 1 S 4", "Ca 2", "Se 1"])
+            cfg.solvent_heavy_conc = self._c(["", "P 425", "Na 100 Cl 100", ""])
+        elif cfg.coefcalc == "SMALLMOLE":
+            cfg.unit_cell_a = round(self._u(5, 50), 3)
+            cfg.unit_cell_b = round(self._u(5, 50), 3)
+            cfg.unit_cell_c = round(self._u(5, 50), 3)
+            cfg.small_mole_atoms = self._c(["Mg O 3", "Fe O 4", "Ca O 2",
+                                             "Na Cl 1", "Cu S 1", "C H 2 O 1"])
+            cfg.num_monomers = self._i(1, 16)
+        elif cfg.coefcalc == "CIF":
+            cfg.cif = self._c(["Fe3O4", "CaCO3", "NaCl",
+                                str(FIXTURES_DIR / "alanine.cif")])
+        elif cfg.coefcalc == "SAXSseq":
+            cfg.seq_file = str(FIXTURES_DIR / self._c(["rcsb_pdb_4OR0.fasta",
+                                                         "insulin_seq.fasta",
+                                                         "bsa_fragment.fasta"]))
+            cfg.protein_conc = round(self._u(0.5, 50.0), 3)
+            cfg.saxs_container = self._flip(0.5)
+
+        # ---- Dose decay model ----
+        cfg.ddm = self._c(["Simple", "Simple", "Linear", "Leal", "Bfactor"])
+        if cfg.ddm in ("Leal", "Bfactor"):
+            cfg.gamma_param = round(self._u(0.1, 2.0), 4)
+            cfg.b0_param = round(self._u(0.1, 10.0), 4)
+            cfg.beta_param = round(self._u(0.01, 2.0), 4)  # must stay positive
+
+        # ---- Subprogram parameters ----
+        if cfg.subprogram == "MONTECARLO":
+            cfg.runs = self._i(1, 3)
+            # Cap electrons so MC overhead ≤ ~1.5x budget in work units
+            max_electrons = int(self.budget * INSULIN_BASE_COST / MC_COST_PER_ELECTRON / max(1, cfg.runs))
+            cfg.sim_electrons = self._i(10_000, min(500_000, max_electrons))
+            cfg.calculate_pe_escape = self._flip(0.4)
+            cfg.calculate_fl_escape = self._flip(0.3)
+        elif cfg.subprogram == "XFEL":
+            cfg.runs = self._i(1, 3)
+            # Cap exposure time: cost = voxels × ExposureTime × XFEL_PER_VOXEL_PER_SECOND
+            # To stay within budget: ExposureTime ≤ budget / (voxels × XFEL_PER_VOXEL_PER_SECOND)
+            ppm3 = cfg.pixels_per_micron ** 3
+            vox = min(cfg.dim_x * cfg.dim_y * cfg.dim_z * ppm3, 1_000_000)
+            max_exposure = self.budget / max(vox * XFEL_PER_VOXEL_PER_SECOND * cfg.runs, 1e-9)
+            max_exposure = max(0.0001, min(max_exposure, 0.01))
+            cfg.exposure_time = round(self._u(0.0001, max_exposure), 6)
+            cfg.pulse_energy = 10 ** self._u(-9, -3)
+        # EMSP has no extra params
+
+        # ---- Beam ----
+        if cfg.subprogram == "EMSP":
+            cfg.energy = float(self._c([100, 200, 300, 400]))
+            cfg.beam_type = "Gaussian"
+            cfg.flux = 10 ** self._u(5, 8)
+        else:
+            cfg.energy = round(self._u(5.0, 25.0), 3)
+            cfg.flux = 10 ** self._u(10, 14)
+            cfg.beam_type = self._c(["Gaussian", "Tophat"])
+
+        if cfg.crystal_type == "Cylinder":
+            cfg.fwhm_x = cfg.fwhm_y = round(self._u(100, min(cfg.dim_y, 1000)), 1)
+            cfg.collimation_x = round(self._u(cfg.fwhm_x, cfg.dim_y * 0.8), 1)
+            cfg.collimation_y = cfg.collimation_x
+        else:
+            cfg.fwhm_x = round(self._u(5, max(10, cfg.dim_x * 1.5)), 2)
+            cfg.fwhm_y = round(self._u(5, max(10, cfg.dim_y * 1.5)), 2)
+            cfg.collimation_x = round(self._u(5, max(10, cfg.dim_x * 2)), 2)
+            cfg.collimation_y = round(self._u(5, max(10, cfg.dim_y * 2)), 2)
+
+        cfg.collimation_type = self._c(["Rectangular", "Circular"])
+
+        # ---- Wedge ----
+        cfg.wedge_start = 0.0
+        if cfg.subprogram in ("XFEL", "EMSP") or cfg.crystal_type == "Cylinder":
+            cfg.wedge_end = 0.0
+            cfg.angular_resolution = 1.0
+        else:
+            cfg.wedge_end = float(self._c([0, 45, 90, 180, 360]))
+            if cfg.wedge_end == 0:
+                cfg.angular_resolution = 1.0
+            else:
+                cfg.angular_resolution = float(self._c([0.5, 1.0, 2.0, 5.0, 10.0]))
+
+        # XFEL exposure_time is already set (capped) in the subprogram section above.
+        if cfg.subprogram != "XFEL":
+            cfg.exposure_time = round(self._u(1.0, 200.0), 2)
+
+        return cfg
+
+    def _minimal_fallback(self) -> Config:
+        """Guaranteed-cheap config used when retries are exhausted."""
+        return Config(
+            crystal_type="Cuboid", dim_x=50, dim_y=50, dim_z=50,
+            pixels_per_micron=0.5, coefcalc="RD3D",
+            unit_cell_a=78, unit_cell_b=78, unit_cell_c=78,
+            num_monomers=24, num_residues=51,
+            beam_type="Gaussian", flux=2e12,
+            fwhm_x=100, fwhm_y=100, energy=12.1,
+            collimation_x=100, collimation_y=100,
+            wedge_start=0, wedge_end=90,
+            exposure_time=10, angular_resolution=5,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Mutation-based generator
+# ---------------------------------------------------------------------------
+
+# Matches integers and floats including scientific notation.
+# Excludes numbers that are part of element symbols like "Fe3O4".
+_NUMBER_RE = re.compile(
+    r'(?<![A-Za-z])(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)(?![A-Za-z])'
+)
+
+
+def mutate_text(text: str, mutation_rate: float = 0.25,
+                rng: Optional[random.Random] = None) -> str:
+    """
+    Perturb numeric values in a seed input file.
+    Uses log-normal noise so values stay in the same order of magnitude.
+    Returns the mutated text; does not check cost budgets.
+    """
+    if rng is None:
+        rng = random.Random()
+
+    def perturb(m: re.Match) -> str:
+        if rng.random() > mutation_rate:
+            return m.group(0)
+        raw = m.group(1)
+        val = float(raw)
+        if val == 0.0:
+            # Zero is special: flip to a small positive value occasionally
+            return "0" if rng.random() < 0.7 else f"{rng.uniform(0.01, 1.0):.3g}"
+        factor = math.exp(rng.gauss(0.0, 0.4))
+        new_val = val * factor
+        # Preserve integer appearance for small whole numbers
+        if '.' not in raw and 'e' not in raw.lower() and val < 10000:
+            return str(max(1, int(round(new_val))))
+        # Use scientific notation when the original did, or for extreme values
+        if 'e' in raw.lower() or abs(new_val) > 1e5 or abs(new_val) < 0.001:
+            return f"{new_val:.3e}"
+        return f"{new_val:.4g}"
+
+    return _NUMBER_RE.sub(perturb, text)

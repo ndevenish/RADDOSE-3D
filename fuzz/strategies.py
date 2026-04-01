@@ -1,0 +1,201 @@
+"""
+Hypothesis strategies for generating RADDOSE-3D Config objects.
+
+Mirrors GrammarGenerator logic but expressed as Hypothesis composites so
+that Hypothesis can shrink failing examples automatically.
+"""
+
+from hypothesis import assume
+from hypothesis import strategies as st
+
+from generate import Config, estimate_cost, DEFAULT_BUDGET
+from generate import FIXTURES_DIR
+
+# ---------------------------------------------------------------------------
+# Leaf-level strategies
+# ---------------------------------------------------------------------------
+
+_ELEMENTS_WITH_COUNTS = st.sampled_from([
+    "Zn 0.333 S 6", "Fe 1 S 4", "Ca 2", "Se 1",
+    "Cu 1", "Mg 1", "Mn 1", "Ni 1",
+])
+
+_SOLVENT_HEAVY = st.sampled_from([
+    "", "P 425", "Na 100 Cl 100", "K 200", "",
+])
+
+_SMALL_MOLE_ATOMS = st.sampled_from([
+    "Mg O 3", "Fe O 4", "Ca O 2",
+    "Na Cl 1", "Cu S 1", "C H 2 O 1",
+])
+
+_CIF_CHOICES = st.sampled_from([
+    "Fe3O4", "CaCO3", "NaCl",
+    str(FIXTURES_DIR / "alanine.cif"),
+])
+
+_FASTA_CHOICES = st.sampled_from([
+    str(FIXTURES_DIR / "rcsb_pdb_4OR0.fasta"),
+    str(FIXTURES_DIR / "insulin_seq.fasta"),
+    str(FIXTURES_DIR / "bsa_fragment.fasta"),
+])
+
+
+# ---------------------------------------------------------------------------
+# Main composite strategy
+# ---------------------------------------------------------------------------
+
+@st.composite
+def raddose_config(draw, budget: float = DEFAULT_BUDGET) -> Config:
+    """
+    Draw a valid Config with estimated_cost <= budget.
+    Uses assume() to discard over-budget examples so Hypothesis learns
+    to avoid them via shrinking.
+    """
+    cfg = Config()
+
+    # ---- Subprogram (controls major simulation mode) ----
+    cfg.subprogram = draw(st.sampled_from(
+        ["", "", "", "", "MONTECARLO", "XFEL", "EMSP"]
+    ))
+
+    # ---- Crystal type ----
+    if cfg.subprogram == "EMSP":
+        cfg.crystal_type = "Cuboid"
+    else:
+        cfg.crystal_type = draw(st.sampled_from(
+            ["Cuboid", "Cuboid", "Cuboid", "Cylinder", "Spherical", "Polyhedron"]
+        ))
+
+    # ---- CoefCalc ----
+    if cfg.subprogram == "EMSP":
+        cfg.coefcalc = "MicroED"
+    elif cfg.crystal_type == "Cylinder":
+        cfg.coefcalc = "SAXSseq"
+    elif cfg.crystal_type == "Polyhedron":
+        cfg.coefcalc = "RD3D"
+    else:
+        cfg.coefcalc = draw(st.sampled_from(["RD3D", "RD3D", "RD3D", "SMALLMOLE", "CIF"]))
+
+    # ---- Crystal dimensions ----
+    if cfg.crystal_type == "Cuboid":
+        cfg.dim_x = draw(st.floats(5, 300, allow_nan=False, allow_infinity=False))
+        cfg.dim_y = draw(st.floats(5, 300, allow_nan=False, allow_infinity=False))
+        cfg.dim_z = draw(st.floats(5, 300, allow_nan=False, allow_infinity=False))
+    elif cfg.crystal_type == "Cylinder":
+        cfg.dim_x = draw(st.floats(200, 3000, allow_nan=False, allow_infinity=False))
+        cfg.dim_y = draw(st.floats(100, 2000, allow_nan=False, allow_infinity=False))
+        cfg.dim_z = cfg.dim_y
+    elif cfg.crystal_type == "Spherical":
+        d = draw(st.floats(5, 300, allow_nan=False, allow_infinity=False))
+        cfg.dim_x = cfg.dim_y = cfg.dim_z = d
+    else:  # Polyhedron — geometry from cube.obj, dims ignored
+        cfg.dim_x = cfg.dim_y = cfg.dim_z = 30.0
+
+    # ---- PixelsPerMicron ----
+    if cfg.crystal_type == "Cylinder":
+        cfg.pixels_per_micron = draw(st.sampled_from([0.005, 0.01, 0.02, 0.05]))
+    elif cfg.coefcalc == "SMALLMOLE":
+        cfg.pixels_per_micron = draw(st.sampled_from([1.0, 2.0, 5.0]))
+    else:
+        cfg.pixels_per_micron = draw(st.sampled_from([0.1, 0.2, 0.5, 1.0, 2.0]))
+
+    # ---- Composition ----
+    if cfg.coefcalc in ("RD3D", "MicroED"):
+        cfg.unit_cell_a = draw(st.floats(20, 200, allow_nan=False, allow_infinity=False))
+        cfg.unit_cell_b = draw(st.floats(20, 200, allow_nan=False, allow_infinity=False))
+        cfg.unit_cell_c = draw(st.floats(20, 200, allow_nan=False, allow_infinity=False))
+        cfg.num_monomers = draw(st.integers(1, 48))
+        cfg.num_residues = draw(st.integers(20, 500))
+        cfg.num_rna = draw(st.integers(0, 5)) if draw(st.booleans()) else 0
+        cfg.num_dna = draw(st.integers(0, 5)) if draw(st.booleans()) else 0
+        cfg.solvent_fraction = draw(st.floats(0.3, 0.85, allow_nan=False, allow_infinity=False))
+        cfg.heavy_protein_atoms = draw(st.one_of(st.just(""), _ELEMENTS_WITH_COUNTS))
+        cfg.solvent_heavy_conc = draw(_SOLVENT_HEAVY)
+    elif cfg.coefcalc == "SMALLMOLE":
+        cfg.unit_cell_a = draw(st.floats(5, 50, allow_nan=False, allow_infinity=False))
+        cfg.unit_cell_b = draw(st.floats(5, 50, allow_nan=False, allow_infinity=False))
+        cfg.unit_cell_c = draw(st.floats(5, 50, allow_nan=False, allow_infinity=False))
+        cfg.small_mole_atoms = draw(_SMALL_MOLE_ATOMS)
+        cfg.num_monomers = draw(st.integers(1, 16))
+    elif cfg.coefcalc == "CIF":
+        cfg.cif = draw(_CIF_CHOICES)
+    elif cfg.coefcalc == "SAXSseq":
+        cfg.seq_file = draw(_FASTA_CHOICES)
+        cfg.protein_conc = draw(st.floats(0.5, 50.0, allow_nan=False, allow_infinity=False))
+        cfg.saxs_container = draw(st.booleans())
+
+    # ---- Dose decay model ----
+    cfg.ddm = draw(st.sampled_from(["Simple", "Simple", "Linear", "Leal", "Bfactor"]))
+    if cfg.ddm in ("Leal", "Bfactor"):
+        cfg.gamma_param = draw(st.floats(0.1, 2.0, allow_nan=False, allow_infinity=False))
+        cfg.b0_param = draw(st.floats(0.1, 10.0, allow_nan=False, allow_infinity=False))
+        cfg.beta_param = draw(st.floats(0.01, 2.0, allow_nan=False, allow_infinity=False))
+
+    # ---- Subprogram parameters ----
+    if cfg.subprogram == "MONTECARLO":
+        cfg.runs = draw(st.integers(1, 3))
+        from generate import MC_COST_PER_ELECTRON, INSULIN_BASE_COST
+        max_electrons = int(budget * INSULIN_BASE_COST / MC_COST_PER_ELECTRON / cfg.runs)
+        cfg.sim_electrons = draw(st.integers(10_000, min(500_000, max(10_000, max_electrons))))
+        cfg.calculate_pe_escape = draw(st.booleans())
+        cfg.calculate_fl_escape = draw(st.booleans())
+    elif cfg.subprogram == "XFEL":
+        cfg.runs = draw(st.integers(1, 3))
+        cfg.pulse_energy = draw(
+            st.floats(1e-9, 1e-3, allow_nan=False, allow_infinity=False)
+        )
+        # exposure_time for XFEL is set below in the Wedge section
+
+    # ---- Beam ----
+    if cfg.subprogram == "EMSP":
+        cfg.energy = float(draw(st.sampled_from([100, 200, 300, 400])))
+        cfg.beam_type = "Gaussian"
+        cfg.flux = draw(st.floats(1e5, 1e8, allow_nan=False, allow_infinity=False))
+    else:
+        cfg.energy = draw(st.floats(5.0, 25.0, allow_nan=False, allow_infinity=False))
+        cfg.flux = draw(st.floats(1e10, 1e14, allow_nan=False, allow_infinity=False))
+        cfg.beam_type = draw(st.sampled_from(["Gaussian", "Tophat"]))
+
+    max_dim = max(cfg.dim_x, cfg.dim_y)
+    if cfg.crystal_type == "Cylinder":
+        hw = draw(st.floats(100, min(cfg.dim_y, 1000), allow_nan=False, allow_infinity=False))
+        cfg.fwhm_x = cfg.fwhm_y = hw
+        cfg.collimation_x = draw(st.floats(hw, cfg.dim_y * 0.9, allow_nan=False, allow_infinity=False))
+        cfg.collimation_y = cfg.collimation_x
+    else:
+        cfg.fwhm_x = draw(st.floats(5, max(10, max_dim * 1.5), allow_nan=False, allow_infinity=False))
+        cfg.fwhm_y = draw(st.floats(5, max(10, max_dim * 1.5), allow_nan=False, allow_infinity=False))
+        cfg.collimation_x = draw(st.floats(5, max(10, max_dim * 2), allow_nan=False, allow_infinity=False))
+        cfg.collimation_y = draw(st.floats(5, max(10, max_dim * 2), allow_nan=False, allow_infinity=False))
+
+    cfg.collimation_type = draw(st.sampled_from(["Rectangular", "Circular"]))
+
+    # ---- Wedge ----
+    cfg.wedge_start = 0.0
+    if cfg.subprogram in ("XFEL", "EMSP") or cfg.crystal_type == "Cylinder":
+        cfg.wedge_end = 0.0
+        cfg.angular_resolution = 1.0
+    else:
+        cfg.wedge_end = float(draw(st.sampled_from([0, 45, 90, 180, 360])))
+        cfg.angular_resolution = float(draw(
+            st.sampled_from([0.5, 1.0, 2.0, 5.0, 10.0])
+        )) if cfg.wedge_end > 0 else 1.0
+
+    if cfg.subprogram == "XFEL":
+        # Cap exposure so XFEL stays within budget.
+        # XFEL_PER_VOXEL_PER_SECOND is already normalized, so:
+        # cost = vox × exposure × XFEL_PER_VOXEL_PER_SECOND × runs <= budget
+        ppm3 = cfg.pixels_per_micron ** 3
+        vox = min(cfg.dim_x * cfg.dim_y * cfg.dim_z * ppm3, 1_000_000)
+        from generate import XFEL_PER_VOXEL_PER_SECOND
+        max_exp = budget / max(vox * XFEL_PER_VOXEL_PER_SECOND * cfg.runs, 1e-9)
+        max_exp = max(0.0001, min(max_exp, 0.01))
+        cfg.exposure_time = draw(st.floats(0.0001, max_exp, allow_nan=False, allow_infinity=False))
+    elif cfg.subprogram not in ("EMSP",):
+        cfg.exposure_time = draw(st.floats(1.0, 200.0, allow_nan=False, allow_infinity=False))
+
+    # ---- Enforce budget ----
+    assume(estimate_cost(cfg) <= budget)
+
+    return cfg
