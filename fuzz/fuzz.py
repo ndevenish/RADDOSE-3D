@@ -427,8 +427,9 @@ def _save_input(
             "crashes/rust" if cat == Category.RUST_CRASH else
             "crashes/both"
         )
-    elif cat in (Category.JAVA_TIMEOUT, Category.RUST_TIMEOUT,
-                 Category.BOTH_TIMEOUT, Category.PERF_DIVERGE):
+    elif cat == Category.PERF_DIVERGE:
+        subdir = "perf_diverge"
+    elif cat in (Category.JAVA_TIMEOUT, Category.RUST_TIMEOUT, Category.BOTH_TIMEOUT):
         subdir = "timeouts"
     else:
         subdir = "diffs"

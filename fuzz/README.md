@@ -91,7 +91,8 @@ corpus/
 │   ├── java/       # Java crashed, Rust succeeded
 │   ├── rust/       # Rust crashed, Java succeeded
 │   └── both/       # Both crashed
-└── timeouts/       # Timeout cases and performance divergences
+├── perf_diverge/   # One timed out, the other succeeded
+└── timeouts/       # Both timed out (or one timed out, other also failed)
 ```
 
 Each saved input has a `.txt` (the input file) and `.json` (metadata: category, diff values, exit codes, stderr snippets).
