@@ -395,8 +395,7 @@ class GrammarGenerator:
                                              "Na Cl 1", "Cu S 1", "C H 2 O 1"])
             cfg.num_monomers = self._i(1, 16)
         elif cfg.coefcalc == "CIF":
-            cfg.cif = self._c(["Fe3O4", "CaCO3", "NaCl",
-                                str(FIXTURES_DIR / "alanine.cif")])
+            cfg.cif = str(FIXTURES_DIR / "alanine.cif")
         elif cfg.coefcalc == "SAXSseq":
             cfg.seq_file = str(FIXTURES_DIR / self._c(["rcsb_pdb_4OR0.fasta",
                                                          "insulin_seq.fasta",

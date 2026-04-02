@@ -4,6 +4,7 @@ Both processes run in parallel. If one finishes before the deadline, the other
 gets a straggler grace period so near-misses aren't misclassified as timeouts.
 """
 
+import re
 import subprocess
 import threading
 import time
@@ -31,12 +32,24 @@ class RunResult:
     error: str = ""             # harness-level error (binary not found, etc.)
 
     @property
+    def _java_parse_error(self) -> bool:
+        """Java exits 0 even on ANTLR parse errors — detect by stdout pattern."""
+        combined = self.stdout + self.stderr
+        return bool(re.search(r'InputException|Parser found \d+ errors', combined))
+
+    @property
     def succeeded(self) -> bool:
-        return self.exit_code == 0 and not self.timed_out and not self.error
+        return (self.exit_code == 0 and not self.timed_out
+                and not self.error and not self._java_parse_error)
 
     @property
     def crashed(self) -> bool:
-        return not self.timed_out and not self.error and self.exit_code != 0
+        if self.timed_out or self.error:
+            return False
+        if self.exit_code != 0:
+            return True
+        # Java exits 0 on parse errors but runs a broken simulation anyway
+        return self._java_parse_error
 
     def summary_csv_path(self) -> Optional[Path]:
         p = self.output_dir / f"{self.impl}-Summary.csv"
