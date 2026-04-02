@@ -176,10 +176,14 @@ def _collect_with_grace(
         now = time.monotonic()
 
         # Recompute deadline each iteration in case the partner just finished.
+        # The straggler always gets at least until hard_deadline; if the partner
+        # finished early it gets up to grace extra seconds beyond that, capped
+        # by absolute_cap.
         with first_done_lock:
             partner_t = first_done_at[0]
         if partner_t is not None:
-            my_deadline = min(partner_t + (absolute_cap - hard_deadline), absolute_cap)
+            my_deadline = min(max(hard_deadline, partner_t + (absolute_cap - hard_deadline)),
+                              absolute_cap)
         else:
             my_deadline = hard_deadline
 
