@@ -123,7 +123,7 @@ def _launch(cmd: list[str], cwd: Path):
             stderr=subprocess.PIPE,
             cwd=str(cwd),
         )
-    except FileNotFoundError as e:
+    except OSError as e:
         return e
 
 
