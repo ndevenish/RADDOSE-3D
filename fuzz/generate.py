@@ -200,6 +200,7 @@ def render(cfg: Config) -> str:
     elif cfg.crystal_type == "Spherical":
         lines.append(f"Dimensions {cfg.dim_x}")
     elif cfg.crystal_type == "Polyhedron":
+        lines.append(f"Dimensions {cfg.dim_x} {cfg.dim_y} {cfg.dim_z}")
         lines.append(f"Wireframetype obj")
         lines.append(f"ModelFile {FIXTURES_DIR / 'cube.obj'}")
 
