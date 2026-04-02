@@ -420,7 +420,12 @@ def _estimate_cost_from_text(text: str) -> float:
     if subprogram == "MONTECARLO":
         runs = int(_find(r'Runs\s+([\d]+)', 1))
         sim_e = _find(r'SimElectrons\s+([\d.eE+\-]+)', 1_000_000)
-        return (base + runs * sim_e * MC_COST_PER_ELECTRON) / INSULIN_BASE_COST
+        has_escape = bool(re.search(
+            r'Calculate(?:PE|FL)Escape\s+TRUE', text, re.IGNORECASE
+        ))
+        from generate import _pe_cost_factor
+        pe_factor = _pe_cost_factor(has_escape)
+        return (base + runs * sim_e * MC_COST_PER_ELECTRON * pe_factor) / INSULIN_BASE_COST
     elif subprogram in ("EMSP", "MICROED"):
         return base * MICROED_MULTIPLIER / INSULIN_BASE_COST
     else:

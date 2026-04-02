@@ -7,6 +7,7 @@ MutationGenerator perturbs numeric fields in existing seed text.
 """
 
 import math
+import os
 import random
 import re
 from dataclasses import dataclass, field
@@ -125,6 +126,22 @@ class Config:
 
 
 # ---------------------------------------------------------------------------
+# Cost estimation helpers
+# ---------------------------------------------------------------------------
+
+def _pe_cost_factor(escape_active: bool) -> float:
+    """
+    Multiplicative cost factor for PE/FL escape in MONTECARLO mode.
+    When PE_ANGLE_RESOLUTION=N is set (default 1), escape calculations
+    cost O(N²) because the track count scales as N² over the sphere.
+    """
+    if not escape_active:
+        return 1.0
+    pe_res = int(os.environ.get("PE_ANGLE_RESOLUTION", "1"))
+    return float(pe_res * pe_res)
+
+
+# ---------------------------------------------------------------------------
 # Cost estimation
 # ---------------------------------------------------------------------------
 
@@ -158,7 +175,8 @@ def estimate_cost(cfg: Config) -> float:
     base = voxels * total_steps
 
     if cfg.subprogram == "MONTECARLO":
-        mc = cfg.runs * cfg.sim_electrons * MC_COST_PER_ELECTRON
+        pe_factor = _pe_cost_factor(cfg.calculate_pe_escape or cfg.calculate_fl_escape)
+        mc = cfg.runs * cfg.sim_electrons * MC_COST_PER_ELECTRON * pe_factor
         return (base + mc) / INSULIN_BASE_COST
     elif cfg.subprogram == "EMSP":
         return base * MICROED_MULTIPLIER / INSULIN_BASE_COST
@@ -395,11 +413,16 @@ class GrammarGenerator:
         # ---- Subprogram parameters ----
         if cfg.subprogram == "MONTECARLO":
             cfg.runs = self._i(1, 3)
-            # Cap electrons so MC overhead ≤ ~1.5x budget in work units
-            max_electrons = int(self.budget * INSULIN_BASE_COST / MC_COST_PER_ELECTRON / max(1, cfg.runs))
-            cfg.sim_electrons = self._i(10_000, min(500_000, max_electrons))
+            # Decide escape flags first — they affect the cost factor
             cfg.calculate_pe_escape = self._flip(0.4)
             cfg.calculate_fl_escape = self._flip(0.3)
+            pe_factor = _pe_cost_factor(cfg.calculate_pe_escape or cfg.calculate_fl_escape)
+            # Cap electrons so MC overhead fits within budget
+            max_electrons = int(
+                self.budget * INSULIN_BASE_COST / MC_COST_PER_ELECTRON
+                / max(1, cfg.runs) / pe_factor
+            )
+            cfg.sim_electrons = self._i(10_000, min(500_000, max(10_000, max_electrons)))
         elif cfg.subprogram == "XFEL":
             cfg.runs = self._i(1, 3)
 

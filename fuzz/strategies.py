@@ -11,6 +11,7 @@ from hypothesis import strategies as st
 from generate import (
     BeamConfig, WedgeConfig, Config, estimate_cost, DEFAULT_BUDGET,
     FIXTURES_DIR, INSULIN_BASE_COST, MC_COST_PER_ELECTRON, XFEL_PER_VOXEL_PER_SECOND,
+    _pe_cost_factor,
 )
 
 # ---------------------------------------------------------------------------
@@ -137,10 +138,12 @@ def raddose_config(draw, budget: float = DEFAULT_BUDGET) -> Config:
     # ---- Subprogram parameters ----
     if cfg.subprogram == "MONTECARLO":
         cfg.runs = draw(st.integers(1, 3))
-        max_electrons = int(budget * INSULIN_BASE_COST / MC_COST_PER_ELECTRON / cfg.runs)
-        cfg.sim_electrons = draw(st.integers(10_000, min(500_000, max(10_000, max_electrons))))
+        # Decide escape flags first — they affect the cost factor
         cfg.calculate_pe_escape = draw(st.booleans())
         cfg.calculate_fl_escape = draw(st.booleans())
+        pe_factor = _pe_cost_factor(cfg.calculate_pe_escape or cfg.calculate_fl_escape)
+        max_electrons = int(budget * INSULIN_BASE_COST / MC_COST_PER_ELECTRON / cfg.runs / pe_factor)
+        cfg.sim_electrons = draw(st.integers(10_000, min(500_000, max(10_000, max_electrons))))
     elif cfg.subprogram == "XFEL":
         cfg.runs = draw(st.integers(1, 3))
 
