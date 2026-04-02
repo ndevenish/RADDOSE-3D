@@ -241,3 +241,45 @@ def _rel_diff(a: float, b: float) -> float:
 
 def _is_nan_inf(v: float) -> bool:
     return math.isnan(v) or math.isinf(v)
+
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) != 3:
+        print(f"Usage: {sys.argv[0]} <java-Summary.csv> <rust-Summary.csv>", file=sys.stderr)
+        sys.exit(1)
+
+    java_path = Path(sys.argv[1])
+    rust_path = Path(sys.argv[2])
+
+    # Build minimal RunResult objects that point at the given CSV files.
+    # summary_csv_path() looks for "{impl}-Summary.csv" in output_dir, so
+    # place a symlink-free workaround by subclassing is not needed — instead
+    # we temporarily patch the paths via a thin wrapper.
+    from harness import RunResult
+
+    class _FileRunResult(RunResult):
+        _csv: Optional[Path] = None
+
+        def summary_csv_path(self) -> Optional[Path]:
+            return self._csv
+
+    def _make(impl: str, csv_path: Path) -> "_FileRunResult":
+        r = _FileRunResult.__new__(_FileRunResult)
+        r.impl = impl
+        r.exit_code = 0
+        r.wall_time = 0.0
+        r.stdout = ""
+        r.stderr = ""
+        r.output_dir = csv_path.parent
+        r.timed_out = False
+        r.error = ""
+        r._csv = csv_path
+        return r
+
+    java_r = _make("java", java_path)
+    rust_r = _make("rust", rust_path)
+
+    result = compare(java_r, rust_r)
+    print(result.summary_line())
