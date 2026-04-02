@@ -32,7 +32,7 @@ class Category(Enum):
         """Categories worth saving to corpus."""
         return self in {
             Category.MAJOR_DIFF, Category.NAN_INF,
-            Category.JAVA_CRASH, Category.RUST_CRASH, Category.BOTH_CRASH,
+            Category.JAVA_CRASH, Category.RUST_CRASH,
             Category.JAVA_TIMEOUT, Category.RUST_TIMEOUT,
             Category.BOTH_TIMEOUT, Category.PERF_DIVERGE,
         }
@@ -192,8 +192,8 @@ def compare(java_result: RunResult, rust_result: RunResult) -> Comparison:
         cat = Category.MAJOR_DIFF
 
     # Check for large runtime divergence even when outputs match.
-    # Use max/min ratio; guard against near-zero times.
-    if jt > 0.5 and rt > 0.5:
+    # Only flag if at least one run exceeds 10s (avoids noise on fast inputs).
+    if jt > 0.5 and rt > 0.5 and max(jt, rt) > 10.0:
         ratio = max(jt, rt) / min(jt, rt)
         if ratio >= PERF_DIVERGE_RATIO:
             slower = "java" if jt > rt else "rust"
