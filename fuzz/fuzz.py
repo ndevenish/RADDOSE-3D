@@ -22,12 +22,14 @@ import argparse
 import json
 import os
 import random
+import re
 import shutil
 import sys
 import tempfile
+import threading
 import time
-from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait
 from pathlib import Path
 
 # Add fuzz/ dir to sys.path so sibling imports work
@@ -46,6 +48,71 @@ FUZZ_DIR = Path(__file__).parent
 CORPUS_DIR = FUZZ_DIR / "corpus"
 RESULTS_DIR = FUZZ_DIR / "results"
 SEEDS_DIR = CORPUS_DIR / "seeds"
+
+
+# ---------------------------------------------------------------------------
+# Skip counter
+# ---------------------------------------------------------------------------
+
+class SkipCounter:
+    """
+    Tracks BOTH_TIMEOUT occurrences per (subprogram, coefcalc, crystal_type)
+    triple and progressively tightens the effective budget for that triple.
+
+    Each BOTH_TIMEOUT halves the budget multiplier for the triple (floor 0.0625,
+    i.e. at most 4 halvings before the triple is effectively frozen out).
+    The multiplier recovers by 25% per non-timeout result so the generator
+    can explore again if the budget was just temporarily miscalibrated.
+
+    Thread-safe: the fuzzer's result-handling thread and the generation thread
+    are the same (generation happens in the main thread before dispatch), so
+    the lock is only there for future safety.
+    """
+
+    MIN_MULTIPLIER = 0.0625   # 1/16 — four halvings
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._multipliers: dict[tuple, float] = defaultdict(lambda: 1.0)
+        self._timeout_counts: Counter = Counter()
+
+    def record_timeout(self, triple: tuple) -> None:
+        with self._lock:
+            cur = self._multipliers[triple]
+            self._multipliers[triple] = max(self.MIN_MULTIPLIER, cur * 0.5)
+            self._timeout_counts[triple] += 1
+
+    def record_ok(self, triple: tuple) -> None:
+        """Partial recovery: nudge multiplier back toward 1.0 on non-timeout."""
+        with self._lock:
+            cur = self._multipliers[triple]
+            if cur < 1.0:
+                self._multipliers[triple] = min(1.0, cur * 1.25)
+
+    def effective_budget(self, triple: tuple, base_budget: float) -> float:
+        with self._lock:
+            return base_budget * self._multipliers[triple]
+
+    def summary(self) -> list[tuple]:
+        """Return list of (triple, multiplier, timeout_count) sorted by most-penalised."""
+        with self._lock:
+            return sorted(
+                [(t, self._multipliers[t], self._timeout_counts[t])
+                 for t in self._timeout_counts],
+                key=lambda x: x[1],
+            )
+
+
+def _triple_from_text(text: str) -> tuple[str, str, str]:
+    """Extract (subprogram, coefcalc, crystal_type) from raw input text."""
+    sub = re.search(r'Subprogram\s+(\w+)', text, re.IGNORECASE)
+    coef = re.search(r'(?:AbsCoefCalc|CoefCalc)\s+(\w+)', text, re.IGNORECASE)
+    ctype = re.search(r'Type\s+(\w+)', text, re.IGNORECASE)
+    return (
+        sub.group(1).upper() if sub else "",
+        coef.group(1).upper() if coef else "RD3D",
+        ctype.group(1).capitalize() if ctype else "Cuboid",
+    )
 
 
 def main():
@@ -88,6 +155,7 @@ def main():
     interesting_saved = 0
     total_java_time = 0.0
     total_rust_time = 0.0
+    skip_counter = SkipCounter()
 
     print(f"RADDOSE-3D differential fuzzer  |  {args.iterations} iterations  |  "
           f"strategy={args.strategy}  |  budget={args.budget}x  |  "
@@ -96,17 +164,6 @@ def main():
     print(f"Rust:  {args.rust_bin}")
     print(f"Log:   {log_path}")
     print()
-
-    # Pre-generate all inputs up front (fast, single-threaded) so the RNG
-    # sequence is deterministic regardless of worker scheduling order.
-    work_items = []
-    for i in range(args.iterations):
-        source, input_text, cfg_cost = _generate(
-            args.strategy, grammar_gen, seeds, rng, args.budget
-        )
-        work_items.append((i, source, input_text, cfg_cost))
-
-    completed: dict[int, tuple] = {}   # iter → (result, java_r, rust_r, source, cost)
 
     def _run_one(item):
         i, source, input_text, cfg_cost = item
@@ -123,60 +180,96 @@ def main():
             result = compare(java_r, rust_r)
         return i, result, java_r, rust_r, source, cfg_cost, input_text
 
+    def _next_item(i: int) -> tuple:
+        """Generate the i-th work item, using skip-counter-adjusted budget."""
+        triple_budget = None   # determined after generation for grammar items
+        source, input_text, cfg_cost = _generate(
+            args.strategy, grammar_gen, seeds, rng, args.budget,
+            skip_counter=skip_counter,
+        )
+        return (i, source, input_text, cfg_cost)
+
     with open(log_path, "w") as log_f, \
          ThreadPoolExecutor(max_workers=args.workers) as pool:
 
-        futures = {pool.submit(_run_one, item): item[0] for item in work_items}
-        pending = args.iterations
+        # Sliding window: keep at most `workers` futures in flight.
+        # Generate inputs lazily so skip_counter adjustments affect next submissions.
+        next_i = 0
+        active: dict = {}   # future → work_item
 
-        for fut in as_completed(futures):
-            i, result, java_r, rust_r, source, cfg_cost, input_text = fut.result()
-            pending -= 1
+        # Prime the pool
+        while next_i < min(args.workers, args.iterations):
+            item = _next_item(next_i)
+            active[pool.submit(_run_one, item)] = item
+            next_i += 1
 
-            # ---- Accumulate stats ----
-            category_counts[result.category.name] += 1
-            total_java_time += result.java_time
-            total_rust_time += result.rust_time
+        done_count = 0
+        while active:
+            finished, _ = wait(active, return_when=FIRST_COMPLETED)
 
-            # ---- Log ----
-            log_entry = {
-                "iter": i,
-                "source": source,
-                "estimated_cost": round(cfg_cost, 3),
-                "category": result.category.name,
-                "max_rel_diff": result.max_rel_diff if not (
-                    result.max_rel_diff == float("inf")
-                ) else "inf",
-                "java_time": round(result.java_time, 2),
-                "rust_time": round(result.rust_time, 2),
-                "note": result.note,
-            }
-            if result.diffs:
-                log_entry["diffs"] = [
-                    {"metric": d.name,
-                     "java": d.java_val,
-                     "rust": d.rust_val,
-                     "rel_diff": d.rel_diff if d.rel_diff != float("inf") else "inf"}
-                    for d in result.diffs
-                ]
-            log_f.write(json.dumps(log_entry) + "\n")
-            log_f.flush()
+            for fut in finished:
+                item = active.pop(fut)
+                i, result, java_r, rust_r, source, cfg_cost, input_text = fut.result()
+                done_count += 1
 
-            # ---- Save interesting inputs ----
-            save_path = None
-            if result.category.interesting or args.save_all:
-                save_path = _save_input(
-                    input_text, result, i, run_id, java_r, rust_r
-                )
-                interesting_saved += 1
+                # ---- Update skip counter ----
+                triple = _triple_from_text(input_text)
+                if result.category == Category.BOTH_TIMEOUT:
+                    skip_counter.record_timeout(triple)
+                else:
+                    skip_counter.record_ok(triple)
 
-            # ---- Progress line ----
-            done = args.iterations - pending
-            marker = "!" if result.category.interesting else " "
-            print(f"[{done:4d}/{args.iterations}]{marker} {result.summary_line()}"
-                  + (f"  -> {save_path.name}" if save_path else ""))
+                # ---- Submit next item while there's work left ----
+                if next_i < args.iterations:
+                    new_item = _next_item(next_i)
+                    active[pool.submit(_run_one, new_item)] = new_item
+                    next_i += 1
+
+                # ---- Accumulate stats ----
+                category_counts[result.category.name] += 1
+                total_java_time += result.java_time
+                total_rust_time += result.rust_time
+
+                # ---- Log ----
+                log_entry = {
+                    "iter": i,
+                    "source": source,
+                    "estimated_cost": round(cfg_cost, 3),
+                    "category": result.category.name,
+                    "max_rel_diff": result.max_rel_diff if not (
+                        result.max_rel_diff == float("inf")
+                    ) else "inf",
+                    "java_time": round(result.java_time, 2),
+                    "rust_time": round(result.rust_time, 2),
+                    "note": result.note,
+                    "triple": list(triple),
+                }
+                if result.diffs:
+                    log_entry["diffs"] = [
+                        {"metric": d.name,
+                         "java": d.java_val,
+                         "rust": d.rust_val,
+                         "rel_diff": d.rel_diff if d.rel_diff != float("inf") else "inf"}
+                        for d in result.diffs
+                    ]
+                log_f.write(json.dumps(log_entry) + "\n")
+                log_f.flush()
+
+                # ---- Save interesting inputs ----
+                save_path = None
+                if result.category.interesting or args.save_all:
+                    save_path = _save_input(
+                        input_text, result, i, run_id, java_r, rust_r
+                    )
+                    interesting_saved += 1
+
+                # ---- Progress line ----
+                marker = "!" if result.category.interesting else " "
+                print(f"[{done_count:4d}/{args.iterations}]{marker} {result.summary_line()}"
+                      + (f"  -> {save_path.name}" if save_path else ""))
 
     # ---- Final stats ----
+    skip_summary = skip_counter.summary()
     stats = {
         "run_id": run_id,
         "iterations": args.iterations,
@@ -187,16 +280,26 @@ def main():
         "avg_java_time": total_java_time / args.iterations,
         "avg_rust_time": total_rust_time / args.iterations,
         "categories": dict(category_counts),
+        "skip_counter": [
+            {"triple": list(t), "multiplier": m, "timeouts": n}
+            for t, m, n in skip_summary
+        ],
     }
     stats_path.write_text(json.dumps(stats, indent=2))
 
     print()
     print("=" * 60)
     print(f"Done.  {interesting_saved} interesting cases saved.")
-    print(f"Category breakdown:")
+    print("Category breakdown:")
     for cat, count in sorted(category_counts.items(), key=lambda x: -x[1]):
         bar = "#" * min(count, 40)
         print(f"  {cat:<22} {count:4d}  {bar}")
+    if skip_summary:
+        print("Skip counter (penalised triples):")
+        for triple, mult, n in skip_summary:
+            sub, coef, ctype = triple
+            print(f"  ({sub or 'none':12} {coef:8} {ctype:10})  "
+                  f"multiplier={mult:.4f}  timeouts={n}")
     print(f"Stats: {stats_path}")
 
 
@@ -210,6 +313,7 @@ def _generate(
     seeds: list[str],
     rng: random.Random,
     budget: float,
+    skip_counter: "SkipCounter | None" = None,
 ) -> tuple[str, str, float]:
     """Return (source_description, input_text, estimated_cost)."""
     use_grammar = (
@@ -219,18 +323,34 @@ def _generate(
     )
 
     if use_grammar:
-        cfg = grammar_gen.generate()
+        if skip_counter is not None:
+            # Temporarily tighten the generator's budget for penalised triples.
+            # GrammarGenerator.generate() retries until cost <= budget, so we
+            # set the budget to the worst effective budget for the next sample,
+            # let it generate, then restore.  Because the Config is sampled
+            # before we know its triple, we generate once, check the triple,
+            # and regenerate with the tighter budget if needed.
+            cfg = grammar_gen.generate()
+            triple = (cfg.subprogram, cfg.coefcalc, cfg.crystal_type)
+            eff = skip_counter.effective_budget(triple, budget)
+            if eff < budget and estimate_cost(cfg) > eff:
+                old = grammar_gen.budget
+                grammar_gen.budget = eff
+                cfg = grammar_gen.generate()
+                grammar_gen.budget = old
+        else:
+            cfg = grammar_gen.generate()
         text = render(cfg)
         cost = estimate_cost(cfg)
         return "grammar", text, cost
     else:
         seed_text = rng.choice(seeds)
         mutated = mutate_text(seed_text, mutation_rate=0.2, rng=rng)
-        # Cost estimation for mutations: use grammar cost model on mutated text
-        # We approximate by using a cheap parse; fall back to 1.0 if uncertain
         cost = _estimate_cost_from_text(mutated)
-        # If cost exceeds budget, scale down mutation by re-mutating with lower rate
-        if cost > budget * 2:
+        # If cost exceeds budget (or skip-adjusted budget), scale down mutation
+        triple = _triple_from_text(mutated)
+        eff = skip_counter.effective_budget(triple, budget) if skip_counter else budget
+        if cost > eff * 2:
             mutated = mutate_text(seed_text, mutation_rate=0.05, rng=rng)
             cost = _estimate_cost_from_text(mutated)
         return "mutate", mutated, cost
