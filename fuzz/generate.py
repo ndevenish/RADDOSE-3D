@@ -35,6 +35,37 @@ MICROED_MULTIPLIER = 2.0
 DEFAULT_BUDGET = 2.0             # ~2x insulin ≈ 24s Java max
 
 
+# ---------------------------------------------------------------------------
+# Per-segment dataclasses
+# ---------------------------------------------------------------------------
+
+@dataclass
+class BeamConfig:
+    """Parameters for a single Beam block."""
+    beam_type: str = "Gaussian"     # Gaussian | Tophat
+    flux: float = 2e12
+    fwhm_x: float = 100.0
+    fwhm_y: float = 100.0
+    energy: float = 12.1
+    collimation_x: float = 100.0
+    collimation_y: float = 100.0
+    collimation_type: str = "Rectangular"  # Rectangular | Circular
+    pulse_energy: float = 2e-6             # XFEL only
+
+
+@dataclass
+class WedgeConfig:
+    """Parameters for a single Wedge block."""
+    start: float = 0.0
+    end: float = 360.0
+    exposure_time: float = 100.0
+    angular_resolution: float = 2.0
+
+
+# ---------------------------------------------------------------------------
+# Top-level Config
+# ---------------------------------------------------------------------------
+
 @dataclass
 class Config:
     # Crystal geometry
@@ -86,23 +117,16 @@ class Config:
     calculate_pe_escape: bool = False
     calculate_fl_escape: bool = False
 
-    # Beam
-    beam_type: str = "Gaussian"   # Gaussian | Tophat
-    flux: float = 2e12
-    fwhm_x: float = 100.0
-    fwhm_y: float = 100.0
-    energy: float = 12.1
-    collimation_x: float = 100.0
-    collimation_y: float = 100.0
-    collimation_type: str = "Rectangular"   # Rectangular | Circular
-    pulse_energy: float = 2e-6              # XFEL only
+    # Beam+Wedge segments: list of (BeamConfig, [WedgeConfig, ...]) pairs.
+    # One entry per Beam block; each entry may have multiple consecutive Wedge blocks.
+    segments: list = field(default_factory=lambda: [
+        (BeamConfig(), [WedgeConfig()])
+    ])
 
-    # Wedge
-    wedge_start: float = 0.0
-    wedge_end: float = 360.0
-    exposure_time: float = 100.0
-    angular_resolution: float = 2.0
 
+# ---------------------------------------------------------------------------
+# Cost estimation
+# ---------------------------------------------------------------------------
 
 def estimate_cost(cfg: Config) -> float:
     """Return cost relative to insulin_test.txt (≈ 1.0)."""
@@ -119,22 +143,32 @@ def estimate_cost(cfg: Config) -> float:
         voxels = cfg.dim_x * cfg.dim_y * cfg.dim_z * ppm3
     voxels = min(voxels, 1_000_000)  # Java auto-caps at 1M
 
-    span = abs(cfg.wedge_end - cfg.wedge_start)
-    steps = max(1.0, span / cfg.angular_resolution) if span > 0 else 1.0
-    base = voxels * steps
+    all_wedges = [w for _, wedges in cfg.segments for w in wedges]
+
+    def _steps(w: WedgeConfig) -> float:
+        span = abs(w.end - w.start)
+        return max(1.0, span / w.angular_resolution) if span > 0 else 1.0
+
+    if cfg.subprogram == "XFEL":
+        # XFEL_PER_VOXEL_PER_SECOND is already normalized, no INSULIN_BASE_COST division.
+        total = sum(voxels * w.exposure_time * XFEL_PER_VOXEL_PER_SECOND for w in all_wedges)
+        return total * max(1, cfg.runs)
+
+    total_steps = sum(_steps(w) for w in all_wedges)
+    base = voxels * total_steps
 
     if cfg.subprogram == "MONTECARLO":
         mc = cfg.runs * cfg.sim_electrons * MC_COST_PER_ELECTRON
         return (base + mc) / INSULIN_BASE_COST
-    elif cfg.subprogram == "XFEL":
-        # XFEL_PER_VOXEL_PER_SECOND is already normalized (= ratio/voxels),
-        # so no further division by INSULIN_BASE_COST needed.
-        return voxels * cfg.exposure_time * XFEL_PER_VOXEL_PER_SECOND * max(1, cfg.runs)
     elif cfg.subprogram == "EMSP":
         return base * MICROED_MULTIPLIER / INSULIN_BASE_COST
     else:
         return base / INSULIN_BASE_COST
 
+
+# ---------------------------------------------------------------------------
+# Renderer
+# ---------------------------------------------------------------------------
 
 def render(cfg: Config) -> str:
     """Render a Config to RADDOSE-3D input file text."""
@@ -200,28 +234,31 @@ def render(cfg: Config) -> str:
         elif cfg.subprogram == "XFEL":
             lines.append(f"Runs {cfg.runs}")
 
+    # ---- One Beam block + N Wedge blocks per segment ----
+    for beam, wedges in cfg.segments:
+        lines.append("")
+        lines.append("Beam")
+        lines.append(f"Type {beam.beam_type}")
+        lines.append(f"Energy {beam.energy}")
+
+        if cfg.subprogram != "EMSP":
+            lines.append(f"Flux {beam.flux:.3e}")
+
+        if beam.beam_type == "Gaussian":
+            lines.append(f"FWHM {beam.fwhm_x} {beam.fwhm_y}")
+
+        lines.append(f"Collimation {beam.collimation_type} {beam.collimation_x} {beam.collimation_y}")
+
+        if cfg.subprogram == "XFEL":
+            lines.append(f"PulseEnergy {beam.pulse_energy:.3e}")
+
+        for w in wedges:
+            lines.append("")
+            lines.append(f"Wedge {w.start} {w.end}")
+            lines.append(f"ExposureTime {w.exposure_time}")
+            lines.append(f"AngularResolution {w.angular_resolution}")
+
     lines.append("")
-    lines.append("Beam")
-    lines.append(f"Type {cfg.beam_type}")
-    lines.append(f"Energy {cfg.energy}")
-
-    if cfg.subprogram != "EMSP":
-        lines.append(f"Flux {cfg.flux:.3e}")
-
-    if cfg.beam_type == "Gaussian":
-        lines.append(f"FWHM {cfg.fwhm_x} {cfg.fwhm_y}")
-
-    lines.append(f"Collimation {cfg.collimation_type} {cfg.collimation_x} {cfg.collimation_y}")
-
-    if cfg.subprogram == "XFEL":
-        lines.append(f"PulseEnergy {cfg.pulse_energy:.3e}")
-
-    lines.append("")
-    lines.append(f"Wedge {cfg.wedge_start} {cfg.wedge_end}")
-    lines.append(f"ExposureTime {cfg.exposure_time}")
-    lines.append(f"AngularResolution {cfg.angular_resolution}")
-    lines.append("")
-
     return "\n".join(lines)
 
 
@@ -365,69 +402,122 @@ class GrammarGenerator:
             cfg.calculate_fl_escape = self._flip(0.3)
         elif cfg.subprogram == "XFEL":
             cfg.runs = self._i(1, 3)
-            # Cap exposure time: cost = voxels × ExposureTime × XFEL_PER_VOXEL_PER_SECOND
-            # To stay within budget: ExposureTime ≤ budget / (voxels × XFEL_PER_VOXEL_PER_SECOND)
-            ppm3 = cfg.pixels_per_micron ** 3
-            vox = min(cfg.dim_x * cfg.dim_y * cfg.dim_z * ppm3, 1_000_000)
-            max_exposure = self.budget / max(vox * XFEL_PER_VOXEL_PER_SECOND * cfg.runs, 1e-9)
-            max_exposure = max(0.0001, min(max_exposure, 0.01))
-            cfg.exposure_time = round(self._u(0.0001, max_exposure), 6)
-            cfg.pulse_energy = 10 ** self._u(-9, -3)
-        # EMSP has no extra params
 
-        # ---- Beam ----
-        if cfg.subprogram == "EMSP":
-            cfg.energy = float(self._c([100, 200, 300, 400]))
-            cfg.beam_type = "Gaussian"
-            cfg.flux = 10 ** self._u(5, 8)
-        else:
-            cfg.energy = round(self._u(5.0, 25.0), 3)
-            cfg.flux = 10 ** self._u(10, 14)
-            cfg.beam_type = self._c(["Gaussian", "Tophat"])
-
-        if cfg.crystal_type == "Cylinder":
-            cfg.fwhm_x = cfg.fwhm_y = round(self._u(100, min(cfg.dim_y, 1000)), 1)
-            cfg.collimation_x = round(self._u(cfg.fwhm_x, cfg.dim_y * 0.8), 1)
-            cfg.collimation_y = cfg.collimation_x
-        else:
-            cfg.fwhm_x = round(self._u(5, max(10, cfg.dim_x * 1.5)), 2)
-            cfg.fwhm_y = round(self._u(5, max(10, cfg.dim_y * 1.5)), 2)
-            cfg.collimation_x = round(self._u(5, max(10, cfg.dim_x * 2)), 2)
-            cfg.collimation_y = round(self._u(5, max(10, cfg.dim_y * 2)), 2)
-
-        cfg.collimation_type = self._c(["Rectangular", "Circular"])
-
-        # ---- Wedge ----
-        cfg.wedge_start = 0.0
-        if cfg.subprogram in ("XFEL", "EMSP") or cfg.crystal_type == "Cylinder":
-            cfg.wedge_end = 0.0
-            cfg.angular_resolution = 1.0
-        else:
-            cfg.wedge_end = float(self._c([0, 45, 90, 180, 360]))
-            if cfg.wedge_end == 0:
-                cfg.angular_resolution = 1.0
-            else:
-                cfg.angular_resolution = float(self._c([0.5, 1.0, 2.0, 5.0, 10.0]))
-
-        # XFEL exposure_time is already set (capped) in the subprogram section above.
-        if cfg.subprogram != "XFEL":
-            cfg.exposure_time = round(self._u(1.0, 200.0), 2)
+        # ---- Segments (Beam+Wedge) ----
+        cfg.segments = self._sample_segments(cfg)
 
         return cfg
 
+    def _sample_beam(self, cfg: Config) -> BeamConfig:
+        """Sample a BeamConfig appropriate for cfg's subprogram and crystal type."""
+        beam = BeamConfig()
+
+        if cfg.subprogram == "EMSP":
+            beam.energy = float(self._c([100, 200, 300, 400]))
+            beam.beam_type = "Gaussian"
+            beam.flux = 10 ** self._u(5, 8)
+        else:
+            beam.energy = round(self._u(5.0, 25.0), 3)
+            beam.flux = 10 ** self._u(10, 14)
+            beam.beam_type = self._c(["Gaussian", "Tophat"])
+
+        if cfg.crystal_type == "Cylinder":
+            hw = round(self._u(100, min(cfg.dim_y, 1000)), 1)
+            beam.fwhm_x = beam.fwhm_y = hw
+            beam.collimation_x = round(self._u(hw, cfg.dim_y * 0.8), 1)
+            beam.collimation_y = beam.collimation_x
+        else:
+            beam.fwhm_x = round(self._u(5, max(10, cfg.dim_x * 1.5)), 2)
+            beam.fwhm_y = round(self._u(5, max(10, cfg.dim_y * 1.5)), 2)
+            beam.collimation_x = round(self._u(5, max(10, cfg.dim_x * 2)), 2)
+            beam.collimation_y = round(self._u(5, max(10, cfg.dim_y * 2)), 2)
+
+        beam.collimation_type = self._c(["Rectangular", "Circular"])
+
+        if cfg.subprogram == "XFEL":
+            beam.pulse_energy = 10 ** self._u(-9, -3)
+
+        return beam
+
+    def _sample_segments(self, cfg: Config) -> list:
+        """
+        Sample Beam+Wedge segments.
+
+        Special modes (XFEL, EMSP, Cylinder, MONTECARLO): single segment, single wedge.
+        Standard mode: 1–3 segments with consecutive angular ranges.
+
+        Returns list of (BeamConfig, [WedgeConfig]) tuples.
+        """
+        ppm3 = cfg.pixels_per_micron ** 3
+        vox = min(cfg.dim_x * cfg.dim_y * cfg.dim_z * ppm3, 1_000_000)
+
+        if cfg.subprogram == "XFEL" or cfg.subprogram == "EMSP" or cfg.crystal_type == "Cylinder":
+            beam = self._sample_beam(cfg)
+            if cfg.subprogram == "XFEL":
+                max_exp = self.budget / max(vox * XFEL_PER_VOXEL_PER_SECOND * cfg.runs, 1e-9)
+                max_exp = max(0.0001, min(max_exp, 0.01))
+                exposure_time = round(self._u(0.0001, max_exp), 6)
+            elif cfg.subprogram == "EMSP":
+                exposure_time = 1.0  # EMSP doesn't use exposure time, placeholder
+            else:
+                exposure_time = round(self._u(1.0, 200.0), 2)
+            wedge = WedgeConfig(start=0.0, end=0.0, angular_resolution=1.0,
+                                exposure_time=exposure_time)
+            return [(beam, [wedge])]
+
+        if cfg.subprogram == "MONTECARLO":
+            beam = self._sample_beam(cfg)
+            wedge_end = float(self._c([0, 45, 90, 180, 360]))
+            res = float(self._c([0.5, 1.0, 2.0, 5.0, 10.0])) if wedge_end > 0 else 1.0
+            wedge = WedgeConfig(
+                start=0.0, end=wedge_end, angular_resolution=res,
+                exposure_time=round(self._u(1.0, 200.0), 2),
+            )
+            return [(beam, [wedge])]
+
+        # Standard mode: 1–3 beam segments with consecutive angle ranges.
+        # Weighted heavily toward 1 segment so multi-segment cases are occasional.
+        n_segs = self._c([1, 1, 1, 2, 2, 3])
+        total_end = float(self._c([0, 45, 90, 180, 360]))
+        res = float(self._c([0.5, 1.0, 2.0, 5.0, 10.0]))
+
+        if n_segs == 1 or total_end == 0:
+            boundaries = [0.0, total_end]
+            n_segs = 1
+        else:
+            pts = sorted(round(self._u(0.0, total_end), 1) for _ in range(n_segs - 1))
+            boundaries = [0.0] + pts + [total_end]
+
+        segments = []
+        for j in range(n_segs):
+            seg_start = boundaries[j]
+            seg_end = boundaries[j + 1]
+            beam = self._sample_beam(cfg)
+            wedge = WedgeConfig(
+                start=seg_start, end=seg_end,
+                angular_resolution=res if seg_end > seg_start else 1.0,
+                exposure_time=round(self._u(1.0, 200.0), 2),
+            )
+            segments.append((beam, [wedge]))
+        return segments
+
     def _minimal_fallback(self) -> Config:
         """Guaranteed-cheap config used when retries are exhausted."""
-        return Config(
+        cfg = Config(
             crystal_type="Cuboid", dim_x=50, dim_y=50, dim_z=50,
             pixels_per_micron=0.5, coefcalc="RD3D",
             unit_cell_a=78, unit_cell_b=78, unit_cell_c=78,
             num_monomers=24, num_residues=51,
-            beam_type="Gaussian", flux=2e12,
-            fwhm_x=100, fwhm_y=100, energy=12.1,
-            collimation_x=100, collimation_y=100,
-            wedge_start=0, wedge_end=90,
-            exposure_time=10, angular_resolution=5,
         )
+        cfg.segments = [(
+            BeamConfig(
+                beam_type="Gaussian", flux=2e12,
+                fwhm_x=100, fwhm_y=100, energy=12.1,
+                collimation_x=100, collimation_y=100,
+            ),
+            [WedgeConfig(start=0, end=90, exposure_time=10, angular_resolution=5)],
+        )]
+        return cfg
 
 
 # ---------------------------------------------------------------------------

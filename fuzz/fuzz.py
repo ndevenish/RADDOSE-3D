@@ -37,7 +37,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from compare import Category, compare
 from generate import (
-    DEFAULT_BUDGET, Config, GrammarGenerator,
+    DEFAULT_BUDGET, Config, BeamConfig, WedgeConfig, GrammarGenerator,
     estimate_cost, mutate_text, render,
 )
 from harness import (
@@ -360,6 +360,7 @@ def _estimate_cost_from_text(text: str) -> float:
     """
     Rough cost estimate from raw input text.
     Extracts key cost-driving parameters with regex.
+    Handles multiple Wedge blocks by summing their costs.
     """
     import re
     from generate import MC_COST_PER_ELECTRON, XFEL_PER_VOXEL_PER_SECOND, MICROED_MULTIPLIER, INSULIN_BASE_COST
@@ -381,29 +382,45 @@ def _estimate_cost_from_text(text: str) -> float:
     ppm = _find(r'PixelsPerMicron\s+([\d.eE+\-]+)', 0.5)
     voxels = min(dx * dy * dz * ppm ** 3, 1_000_000)
 
-    wedge_m = re.search(r'Wedge\s+([\d.eE+\-]+)\s+([\d.eE+\-]+)', text, re.IGNORECASE)
-    if wedge_m:
-        span = abs(float(wedge_m.group(2)) - float(wedge_m.group(1)))
-    else:
-        span = 360.0
-    res = _find(r'AngularResolution\s+([\d.eE+\-]+)', 2.0)
-    steps = max(1.0, span / res) if span > 0 else 1.0
-
-    base = voxels * steps
-
-    # Subprogram modifiers
+    # Subprogram
     sub_m = re.search(r'Subprogram\s+(\w+)', text, re.IGNORECASE)
     subprogram = sub_m.group(1).upper() if sub_m else ""
+
+    # Find all Wedge blocks and their AngularResolution values (in order)
+    wedge_matches = list(re.finditer(
+        r'Wedge\s+([\d.eE+\-]+)\s+([\d.eE+\-]+)', text, re.IGNORECASE
+    ))
+    res_values = [
+        float(m.group(1))
+        for m in re.finditer(r'AngularResolution\s+([\d.eE+\-]+)', text, re.IGNORECASE)
+    ]
+
+    if subprogram == "XFEL":
+        runs = int(_find(r'Runs\s+([\d]+)', 1))
+        # Sum all ExposureTime values (one per Wedge block)
+        exposure_values = [
+            float(m.group(1))
+            for m in re.finditer(r'ExposureTime\s+([\d.eE+\-]+)', text, re.IGNORECASE)
+        ]
+        total_exposure = sum(exposure_values) if exposure_values else 1.0
+        return voxels * total_exposure * XFEL_PER_VOXEL_PER_SECOND * runs
+
+    # Sum angle-steps across all Wedge blocks
+    if not wedge_matches:
+        total_steps = 180.0  # fallback: 360° / 2° resolution
+    else:
+        total_steps = 0.0
+        for i, wm in enumerate(wedge_matches):
+            span = abs(float(wm.group(2)) - float(wm.group(1)))
+            res = res_values[i] if i < len(res_values) else 2.0
+            total_steps += max(1.0, span / res) if span > 0 else 1.0
+
+    base = voxels * total_steps
 
     if subprogram == "MONTECARLO":
         runs = int(_find(r'Runs\s+([\d]+)', 1))
         sim_e = _find(r'SimElectrons\s+([\d.eE+\-]+)', 1_000_000)
         return (base + runs * sim_e * MC_COST_PER_ELECTRON) / INSULIN_BASE_COST
-    elif subprogram == "XFEL":
-        runs = int(_find(r'Runs\s+([\d]+)', 1))
-        exposure = _find(r'ExposureTime\s+([\d.eE+\-]+)', 1.0)
-        xfel_voxels = min(dx * dy * dz * ppm ** 3, 1_000_000)
-        return xfel_voxels * exposure * XFEL_PER_VOXEL_PER_SECOND * runs
     elif subprogram in ("EMSP", "MICROED"):
         return base * MICROED_MULTIPLIER / INSULIN_BASE_COST
     else:

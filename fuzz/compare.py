@@ -142,25 +142,35 @@ def compare(java_result: RunResult, rust_result: RunResult) -> Comparison:
                           java_time=jt, rust_time=rt)
 
     try:
-        java_metrics = _parse_summary_csv(java_csv)
-        rust_metrics = _parse_summary_csv(rust_csv)
+        java_rows = _parse_summary_csv(java_csv)
+        rust_rows = _parse_summary_csv(rust_csv)
     except Exception as e:
         return Comparison(Category.PARSE_ERROR, note=str(e),
                           java_time=jt, rust_time=rt)
 
+    if len(java_rows) != len(rust_rows):
+        return Comparison(
+            Category.PARSE_ERROR,
+            note=f"wedge row count mismatch: java={len(java_rows)} rust={len(rust_rows)}",
+            java_time=jt, rust_time=rt,
+        )
+
+    multi_wedge = len(java_rows) > 1
     diffs = []
-    for name in COMPARE_METRICS:
-        j = java_metrics.get(name)
-        r = rust_metrics.get(name)
-        if j is None or r is None:
-            continue
-        nan_inf = _is_nan_inf(j) or _is_nan_inf(r)
-        if nan_inf and not (_is_nan_inf(j) and _is_nan_inf(r)):
-            # One has NaN/Inf, other doesn't
-            diffs.append(MetricDiff(name, j, r, rel_diff=float("inf"), is_nan_inf=True))
-        elif not (math.isnan(j) or math.isnan(r)):
-            rel = _rel_diff(j, r)
-            diffs.append(MetricDiff(name, j, r, rel_diff=rel, is_nan_inf=False))
+    for row_idx, (java_metrics, rust_metrics) in enumerate(zip(java_rows, rust_rows)):
+        for name in COMPARE_METRICS:
+            j = java_metrics.get(name)
+            r = rust_metrics.get(name)
+            if j is None or r is None:
+                continue
+            label = f"{name}[{row_idx}]" if multi_wedge else name
+            nan_inf = _is_nan_inf(j) or _is_nan_inf(r)
+            if nan_inf and not (_is_nan_inf(j) and _is_nan_inf(r)):
+                # One has NaN/Inf, other doesn't
+                diffs.append(MetricDiff(label, j, r, rel_diff=float("inf"), is_nan_inf=True))
+            elif not (math.isnan(j) or math.isnan(r)):
+                rel = _rel_diff(j, r)
+                diffs.append(MetricDiff(label, j, r, rel_diff=rel, is_nan_inf=False))
 
     if not diffs:
         return Comparison(Category.PARSE_ERROR, note="no comparable metrics found",
@@ -199,8 +209,8 @@ def compare(java_result: RunResult, rust_result: RunResult) -> Comparison:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _parse_summary_csv(path: Path) -> dict[str, float]:
-    """Parse a RADDOSE-3D Summary.csv into {metric_name: value}."""
+def _parse_summary_csv(path: Path) -> list[dict[str, float]]:
+    """Parse a RADDOSE-3D Summary.csv into a list of {metric_name: value} dicts, one per wedge row."""
     with open(path) as f:
         reader = csv.DictReader(f)
         rows = list(reader)
@@ -208,17 +218,18 @@ def _parse_summary_csv(path: Path) -> dict[str, float]:
     if not rows:
         raise ValueError(f"Empty CSV: {path}")
 
-    # Use the last wedge row (or only row if single wedge)
-    row = rows[-1]
-    result = {}
-    for key, val in row.items():
-        if key is None:
-            continue
-        clean_key = key.strip()
-        try:
-            result[clean_key] = float(val.strip())
-        except (ValueError, AttributeError):
-            pass
+    result = []
+    for row in rows:
+        d = {}
+        for key, val in row.items():
+            if key is None:
+                continue
+            clean_key = key.strip()
+            try:
+                d[clean_key] = float(val.strip())
+            except (ValueError, AttributeError):
+                pass
+        result.append(d)
     return result
 
 

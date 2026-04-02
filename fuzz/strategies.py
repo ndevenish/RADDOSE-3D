@@ -8,8 +8,10 @@ that Hypothesis can shrink failing examples automatically.
 from hypothesis import assume
 from hypothesis import strategies as st
 
-from generate import Config, estimate_cost, DEFAULT_BUDGET
-from generate import FIXTURES_DIR
+from generate import (
+    BeamConfig, WedgeConfig, Config, estimate_cost, DEFAULT_BUDGET,
+    FIXTURES_DIR, INSULIN_BASE_COST, MC_COST_PER_ELECTRON, XFEL_PER_VOXEL_PER_SECOND,
+)
 
 # ---------------------------------------------------------------------------
 # Leaf-level strategies
@@ -135,65 +137,99 @@ def raddose_config(draw, budget: float = DEFAULT_BUDGET) -> Config:
     # ---- Subprogram parameters ----
     if cfg.subprogram == "MONTECARLO":
         cfg.runs = draw(st.integers(1, 3))
-        from generate import MC_COST_PER_ELECTRON, INSULIN_BASE_COST
         max_electrons = int(budget * INSULIN_BASE_COST / MC_COST_PER_ELECTRON / cfg.runs)
         cfg.sim_electrons = draw(st.integers(10_000, min(500_000, max(10_000, max_electrons))))
         cfg.calculate_pe_escape = draw(st.booleans())
         cfg.calculate_fl_escape = draw(st.booleans())
     elif cfg.subprogram == "XFEL":
         cfg.runs = draw(st.integers(1, 3))
-        cfg.pulse_energy = draw(
-            st.floats(1e-9, 1e-3, allow_nan=False, allow_infinity=False)
-        )
-        # exposure_time for XFEL is set below in the Wedge section
 
-    # ---- Beam ----
-    if cfg.subprogram == "EMSP":
-        cfg.energy = float(draw(st.sampled_from([100, 200, 300, 400])))
-        cfg.beam_type = "Gaussian"
-        cfg.flux = draw(st.floats(1e5, 1e8, allow_nan=False, allow_infinity=False))
-    else:
-        cfg.energy = draw(st.floats(5.0, 25.0, allow_nan=False, allow_infinity=False))
-        cfg.flux = draw(st.floats(1e10, 1e14, allow_nan=False, allow_infinity=False))
-        cfg.beam_type = draw(st.sampled_from(["Gaussian", "Tophat"]))
+    # ---- Helper: draw a BeamConfig appropriate for cfg ----
+    def _draw_beam() -> BeamConfig:
+        beam = BeamConfig()
+        if cfg.subprogram == "EMSP":
+            beam.energy = float(draw(st.sampled_from([100, 200, 300, 400])))
+            beam.beam_type = "Gaussian"
+            beam.flux = draw(st.floats(1e5, 1e8, allow_nan=False, allow_infinity=False))
+        else:
+            beam.energy = draw(st.floats(5.0, 25.0, allow_nan=False, allow_infinity=False))
+            beam.flux = draw(st.floats(1e10, 1e14, allow_nan=False, allow_infinity=False))
+            beam.beam_type = draw(st.sampled_from(["Gaussian", "Tophat"]))
 
-    max_dim = max(cfg.dim_x, cfg.dim_y)
-    if cfg.crystal_type == "Cylinder":
-        hw = draw(st.floats(100, min(cfg.dim_y, 1000), allow_nan=False, allow_infinity=False))
-        cfg.fwhm_x = cfg.fwhm_y = hw
-        cfg.collimation_x = draw(st.floats(hw, cfg.dim_y * 0.9, allow_nan=False, allow_infinity=False))
-        cfg.collimation_y = cfg.collimation_x
-    else:
-        cfg.fwhm_x = draw(st.floats(5, max(10, max_dim * 1.5), allow_nan=False, allow_infinity=False))
-        cfg.fwhm_y = draw(st.floats(5, max(10, max_dim * 1.5), allow_nan=False, allow_infinity=False))
-        cfg.collimation_x = draw(st.floats(5, max(10, max_dim * 2), allow_nan=False, allow_infinity=False))
-        cfg.collimation_y = draw(st.floats(5, max(10, max_dim * 2), allow_nan=False, allow_infinity=False))
+        max_dim = max(cfg.dim_x, cfg.dim_y)
+        if cfg.crystal_type == "Cylinder":
+            hw = draw(st.floats(100, min(cfg.dim_y, 1000), allow_nan=False, allow_infinity=False))
+            beam.fwhm_x = beam.fwhm_y = hw
+            beam.collimation_x = draw(st.floats(hw, cfg.dim_y * 0.9, allow_nan=False, allow_infinity=False))
+            beam.collimation_y = beam.collimation_x
+        else:
+            beam.fwhm_x = draw(st.floats(5, max(10, max_dim * 1.5), allow_nan=False, allow_infinity=False))
+            beam.fwhm_y = draw(st.floats(5, max(10, max_dim * 1.5), allow_nan=False, allow_infinity=False))
+            beam.collimation_x = draw(st.floats(5, max(10, max_dim * 2), allow_nan=False, allow_infinity=False))
+            beam.collimation_y = draw(st.floats(5, max(10, max_dim * 2), allow_nan=False, allow_infinity=False))
 
-    cfg.collimation_type = draw(st.sampled_from(["Rectangular", "Circular"]))
+        beam.collimation_type = draw(st.sampled_from(["Rectangular", "Circular"]))
 
-    # ---- Wedge ----
-    cfg.wedge_start = 0.0
+        if cfg.subprogram == "XFEL":
+            beam.pulse_energy = draw(st.floats(1e-9, 1e-3, allow_nan=False, allow_infinity=False))
+
+        return beam
+
+    # ---- Segments (Beam+Wedge pairs) ----
     if cfg.subprogram in ("XFEL", "EMSP") or cfg.crystal_type == "Cylinder":
-        cfg.wedge_end = 0.0
-        cfg.angular_resolution = 1.0
-    else:
-        cfg.wedge_end = float(draw(st.sampled_from([0, 45, 90, 180, 360])))
-        cfg.angular_resolution = float(draw(
-            st.sampled_from([0.5, 1.0, 2.0, 5.0, 10.0])
-        )) if cfg.wedge_end > 0 else 1.0
+        # Single segment, single wedge with end=0 (single-image or SAXS)
+        beam = _draw_beam()
+        if cfg.subprogram == "XFEL":
+            ppm3 = cfg.pixels_per_micron ** 3
+            vox = min(cfg.dim_x * cfg.dim_y * cfg.dim_z * ppm3, 1_000_000)
+            max_exp = budget / max(vox * XFEL_PER_VOXEL_PER_SECOND * cfg.runs, 1e-9)
+            max_exp = max(0.0001, min(max_exp, 0.01))
+            exposure_time = draw(st.floats(0.0001, max_exp, allow_nan=False, allow_infinity=False))
+        elif cfg.subprogram == "EMSP":
+            exposure_time = 1.0
+        else:
+            exposure_time = draw(st.floats(1.0, 200.0, allow_nan=False, allow_infinity=False))
+        wedge = WedgeConfig(start=0.0, end=0.0, angular_resolution=1.0, exposure_time=exposure_time)
+        cfg.segments = [(beam, [wedge])]
 
-    if cfg.subprogram == "XFEL":
-        # Cap exposure so XFEL stays within budget.
-        # XFEL_PER_VOXEL_PER_SECOND is already normalized, so:
-        # cost = vox × exposure × XFEL_PER_VOXEL_PER_SECOND × runs <= budget
-        ppm3 = cfg.pixels_per_micron ** 3
-        vox = min(cfg.dim_x * cfg.dim_y * cfg.dim_z * ppm3, 1_000_000)
-        from generate import XFEL_PER_VOXEL_PER_SECOND
-        max_exp = budget / max(vox * XFEL_PER_VOXEL_PER_SECOND * cfg.runs, 1e-9)
-        max_exp = max(0.0001, min(max_exp, 0.01))
-        cfg.exposure_time = draw(st.floats(0.0001, max_exp, allow_nan=False, allow_infinity=False))
-    elif cfg.subprogram not in ("EMSP",):
-        cfg.exposure_time = draw(st.floats(1.0, 200.0, allow_nan=False, allow_infinity=False))
+    elif cfg.subprogram == "MONTECARLO":
+        # Single segment for MC
+        beam = _draw_beam()
+        wedge_end = float(draw(st.sampled_from([0, 45, 90, 180, 360])))
+        res = float(draw(st.sampled_from([0.5, 1.0, 2.0, 5.0, 10.0]))) if wedge_end > 0 else 1.0
+        wedge = WedgeConfig(
+            start=0.0, end=wedge_end, angular_resolution=res,
+            exposure_time=draw(st.floats(1.0, 200.0, allow_nan=False, allow_infinity=False)),
+        )
+        cfg.segments = [(beam, [wedge])]
+
+    else:
+        # Standard mode: 1–3 beam segments with consecutive angle ranges.
+        n_segs = draw(st.integers(min_value=1, max_value=3))
+        total_end = float(draw(st.sampled_from([0, 45, 90, 180, 360])))
+        res = float(draw(st.sampled_from([0.5, 1.0, 2.0, 5.0, 10.0])))
+
+        if n_segs == 1 or total_end == 0:
+            n_segs = 1
+            boundaries = [0.0, total_end]
+        else:
+            pts = sorted([
+                draw(st.floats(0.0, total_end, allow_nan=False, allow_infinity=False))
+                for _ in range(n_segs - 1)
+            ])
+            boundaries = [0.0] + pts + [total_end]
+
+        cfg.segments = []
+        for j in range(n_segs):
+            seg_start = boundaries[j]
+            seg_end = boundaries[j + 1]
+            beam = _draw_beam()
+            wedge = WedgeConfig(
+                start=seg_start, end=seg_end,
+                angular_resolution=res if seg_end > seg_start else 1.0,
+                exposure_time=draw(st.floats(1.0, 200.0, allow_nan=False, allow_infinity=False)),
+            )
+            cfg.segments.append((beam, [wedge]))
 
     # ---- Enforce budget ----
     assume(estimate_cost(cfg) <= budget)
