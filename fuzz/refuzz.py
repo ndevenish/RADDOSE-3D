@@ -186,7 +186,7 @@ def _update_corpus(
     new_stem = _rename_stem(txt_path.stem, new_result.category.name)
     dest_txt = dest_dir / f"{new_stem}.txt"
 
-    if dest_txt == txt_path:
+    if dest_txt.resolve() == txt_path.resolve():
         # Same location — just update the sidecar
         if not dry_run:
             json_path.write_text(json.dumps(new_meta, indent=2))
