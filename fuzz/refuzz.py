@@ -70,6 +70,22 @@ def _old_category_name(txt_path: Path) -> str | None:
     return None
 
 
+def _rename_stem(stem: str, new_cat_name: str) -> str:
+    """Replace the category token in a filename stem with new_cat_name.
+
+    Handles collision suffixes like _1 or _1_1 that may follow the category.
+    """
+    for cat in Category:
+        marker = f"_{cat.name}"
+        idx = stem.find(marker)
+        if idx != -1:
+            suffix = stem[idx + len(marker):]  # e.g. "", "_1", "_1_1"
+            prefix = stem[:idx]
+            return f"{prefix}_{new_cat_name}{suffix}"
+    # Filename doesn't follow convention — append new category
+    return f"{stem}_{new_cat_name}"
+
+
 def _collect_inputs(paths: list[str]) -> list[Path]:
     seen: set[Path] = set()
     result: list[Path] = []
@@ -167,7 +183,8 @@ def _update_corpus(
         return "deleted", None
 
     dest_dir = CORPUS_DIR / new_subdir
-    dest_txt = dest_dir / txt_path.name
+    new_stem = _rename_stem(txt_path.stem, new_result.category.name)
+    dest_txt = dest_dir / f"{new_stem}.txt"
 
     if dest_txt == txt_path:
         # Same location — just update the sidecar
@@ -180,9 +197,8 @@ def _update_corpus(
         dest_dir.mkdir(parents=True, exist_ok=True)
         # Avoid clobbering an existing file with the same name
         if dest_txt.exists():
-            stem = txt_path.stem
             for i in range(1, 1000):
-                candidate = dest_dir / f"{stem}_{i}.txt"
+                candidate = dest_dir / f"{new_stem}_{i}.txt"
                 if not candidate.exists():
                     dest_txt = candidate
                     break
