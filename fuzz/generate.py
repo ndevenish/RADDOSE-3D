@@ -252,7 +252,9 @@ def render(cfg: Config) -> str:
         lines.append(f"ModelFile {FIXTURES_DIR / 'cube.obj'}")
 
     lines.append(f"PixelsPerMicron {cfg.pixels_per_micron}")
-    lines.append(f"AbsCoefCalc {cfg.coefcalc}")
+    # Java's grammar token named CIF matches the text "EXPSM", not "CIF".
+    coefcalc_keyword = "EXPSM" if cfg.coefcalc == "CIF" else cfg.coefcalc
+    lines.append(f"AbsCoefCalc {coefcalc_keyword}")
 
     if cfg.coefcalc in ("RD3D", "MicroED"):
         lines.append(f"UnitCell {cfg.unit_cell_a} {cfg.unit_cell_b} {cfg.unit_cell_c}")
