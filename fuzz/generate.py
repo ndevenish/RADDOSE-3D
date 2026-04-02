@@ -17,6 +17,53 @@ from typing import Optional
 FIXTURES_DIR = Path(__file__).parent.parent / "raddose3d" / "tests" / "fixtures"
 
 # ---------------------------------------------------------------------------
+# Element pools — used by both GrammarGenerator and Hypothesis strategies
+# ---------------------------------------------------------------------------
+
+# Atoms that make up a small-molecule crystal formula unit.
+# Integer stoichiometric counts (1–12).
+SMALL_MOLE_ELEMENT_POOL = [
+    "C", "H", "N", "O", "S", "P", "F", "Cl", "Br", "I",
+    "Na", "Mg", "Al", "Si", "K", "Ca", "Mn", "Fe", "Co", "Ni", "Cu", "Zn",
+    "Se", "Mo", "Ag",
+]
+
+# Anomalously scattering atoms added to a protein.
+# Counts are per-monomer occupancies (fractional allowed, 0.1–10).
+HEAVY_PROTEIN_ELEMENT_POOL = [
+    "Se", "S", "Zn", "Fe", "Cu", "Mn", "Ca", "Co", "Ni",
+    "Br", "I", "Hg", "Pt", "Au", "Mo",
+]
+
+# Heavy atoms dissolved in the solvent, given as concentration in mM (1–2000).
+SOLVENT_HEAVY_ELEMENT_POOL = [
+    "Na", "K", "Mg", "Ca", "Mn", "Fe", "Zn", "Cu", "Se",
+    "Br", "I", "P", "Cl", "Rb", "Sr", "Cs", "Ba",
+]
+
+
+def _element_counts_str(
+    rng: random.Random,
+    pool: list[str],
+    n_lo: int,
+    n_hi: int,
+    count_lo: float,
+    count_hi: float,
+    integer_counts: bool = True,
+) -> str:
+    """Return a 'El count El count …' string with 1–n_hi unique elements."""
+    n = rng.randint(n_lo, min(n_hi, len(pool)))
+    elements = rng.sample(pool, n)
+    parts = []
+    for el in elements:
+        if integer_counts:
+            count: float = rng.randint(int(count_lo), int(count_hi))
+        else:
+            count = round(rng.uniform(count_lo, count_hi), 3)
+        parts.append(f"{el} {count}")
+    return " ".join(parts)
+
+# ---------------------------------------------------------------------------
 # Cost model — normalized so insulin_test.txt ≈ 1.0 (Java ~12s)
 #
 # Calibration measurements (Java, aarch64):
@@ -385,14 +432,21 @@ class GrammarGenerator:
             cfg.num_rna = self._i(0, 5) if self._flip(0.1) else 0
             cfg.num_dna = self._i(0, 5) if self._flip(0.1) else 0
             cfg.solvent_fraction = round(self._u(0.3, 0.85), 4)
-            cfg.heavy_protein_atoms = self._c(["", "Zn 0.333 S 6", "Fe 1 S 4", "Ca 2", "Se 1"])
-            cfg.solvent_heavy_conc = self._c(["", "P 425", "Na 100 Cl 100", ""])
+            cfg.heavy_protein_atoms = (
+                _element_counts_str(self.rng, HEAVY_PROTEIN_ELEMENT_POOL, 1, 3, 0.1, 10.0, integer_counts=False)
+                if self._flip(0.5) else ""
+            )
+            cfg.solvent_heavy_conc = (
+                _element_counts_str(self.rng, SOLVENT_HEAVY_ELEMENT_POOL, 1, 3, 1, 2000, integer_counts=True)
+                if self._flip(0.5) else ""
+            )
         elif cfg.coefcalc == "SMALLMOLE":
             cfg.unit_cell_a = round(self._u(5, 50), 3)
             cfg.unit_cell_b = round(self._u(5, 50), 3)
             cfg.unit_cell_c = round(self._u(5, 50), 3)
-            cfg.small_mole_atoms = self._c(["Mg O 3", "Fe O 4", "Ca O 2",
-                                             "Na Cl 1", "Cu S 1", "C H 2 O 1"])
+            cfg.small_mole_atoms = _element_counts_str(
+                self.rng, SMALL_MOLE_ELEMENT_POOL, 1, 4, 1, 12, integer_counts=True
+            )
             cfg.num_monomers = self._i(1, 16)
         elif cfg.coefcalc == "CIF":
             cfg.cif = str(FIXTURES_DIR / "alanine.cif")

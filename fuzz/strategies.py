@@ -12,25 +12,49 @@ from generate import (
     BeamConfig, WedgeConfig, Config, estimate_cost, DEFAULT_BUDGET,
     FIXTURES_DIR, INSULIN_BASE_COST, MC_COST_PER_ELECTRON, XFEL_PER_VOXEL_PER_SECOND,
     _pe_cost_factor,
+    SMALL_MOLE_ELEMENT_POOL, HEAVY_PROTEIN_ELEMENT_POOL, SOLVENT_HEAVY_ELEMENT_POOL,
 )
 
 # ---------------------------------------------------------------------------
 # Leaf-level strategies
 # ---------------------------------------------------------------------------
 
-_ELEMENTS_WITH_COUNTS = st.sampled_from([
-    "Zn 0.333 S 6", "Fe 1 S 4", "Ca 2", "Se 1",
-    "Cu 1", "Mg 1", "Mn 1", "Ni 1",
-])
+@st.composite
+def _element_counts_st(
+    draw,
+    pool: list[str],
+    n_lo: int,
+    n_hi: int,
+    count_lo: float,
+    count_hi: float,
+    integer_counts: bool = True,
+) -> str:
+    """Draw a 'El count El count …' string with unique elements from pool."""
+    n = draw(st.integers(n_lo, min(n_hi, len(pool))))
+    elements = draw(st.lists(st.sampled_from(pool), min_size=n, max_size=n, unique=True))
+    parts = []
+    for el in elements:
+        if integer_counts:
+            count: float = draw(st.integers(int(count_lo), int(count_hi)))
+        else:
+            count = draw(st.floats(count_lo, count_hi, allow_nan=False, allow_infinity=False))
+            count = round(count, 3)
+        parts.append(f"{el} {count}")
+    return " ".join(parts)
 
-_SOLVENT_HEAVY = st.sampled_from([
-    "", "P 425", "Na 100 Cl 100", "K 200", "",
-])
 
-_SMALL_MOLE_ATOMS = st.sampled_from([
-    "Mg O 3", "Fe O 4", "Ca O 2",
-    "Na Cl 1", "Cu S 1", "C H 2 O 1",
-])
+_ELEMENTS_WITH_COUNTS = _element_counts_st(
+    HEAVY_PROTEIN_ELEMENT_POOL, n_lo=1, n_hi=3, count_lo=0.1, count_hi=10.0, integer_counts=False
+)
+
+_SOLVENT_HEAVY = st.one_of(
+    st.just(""),
+    _element_counts_st(SOLVENT_HEAVY_ELEMENT_POOL, n_lo=1, n_hi=3, count_lo=1, count_hi=2000, integer_counts=True),
+)
+
+_SMALL_MOLE_ATOMS = _element_counts_st(
+    SMALL_MOLE_ELEMENT_POOL, n_lo=1, n_hi=4, count_lo=1, count_hi=12, integer_counts=True
+)
 
 _CIF_CHOICES = st.sampled_from([
     "Fe3O4", "CaCO3", "NaCl",
