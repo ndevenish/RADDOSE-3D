@@ -234,7 +234,14 @@ def _parse_summary_csv(path: Path) -> list[dict[str, float]]:
 
 
 def _rel_diff(a: float, b: float) -> float:
-    """Relative difference, safe for near-zero values."""
+    """Relative difference, safe for near-zero values.
+
+    Absolute differences below ABS_FLOOR are treated as zero — this avoids
+    false positives when Java's 6 d.p. CSV output truncates a tiny value to
+    0.000000 while Rust emits full precision (e.g. 3.88e-7 vs 0.0).
+    """
+    if abs(a - b) < 5e-7:
+        return 0.0
     denom = max(abs(a), abs(b), 1e-30)
     return abs(a - b) / denom
 
