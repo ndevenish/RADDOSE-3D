@@ -55,6 +55,7 @@ COMPARE_METRICS = [
 TOL_MATCH = 1e-4      # 0.01%  — differences below this are "match"
 TOL_MINOR = 1e-2      # 1%     — differences below this are "minor"
 # differences >= TOL_MINOR are "major"
+PERF_DIVERGE_RATIO = 3.0   # wall-time ratio to flag as PERF_DIVERGE
 
 
 @dataclass
@@ -101,21 +102,15 @@ def compare(java_result: RunResult, rust_result: RunResult) -> Comparison:
     if java_result.timed_out and rust_result.timed_out:
         return Comparison(Category.BOTH_TIMEOUT, java_time=jt, rust_time=rt)
 
-    if java_result.timed_out and rust_result.succeeded:
-        return Comparison(Category.PERF_DIVERGE,
-                          note="java timed out, rust succeeded",
-                          java_time=jt, rust_time=rt)
-
-    if rust_result.timed_out and java_result.succeeded:
-        return Comparison(Category.PERF_DIVERGE,
-                          note="rust timed out, java succeeded",
-                          java_time=jt, rust_time=rt)
-
     if java_result.timed_out:
-        return Comparison(Category.JAVA_TIMEOUT, java_time=jt, rust_time=rt)
+        return Comparison(Category.JAVA_TIMEOUT,
+                          note="java timed out, rust succeeded" if rust_result.succeeded else "",
+                          java_time=jt, rust_time=rt)
 
     if rust_result.timed_out:
-        return Comparison(Category.RUST_TIMEOUT, java_time=jt, rust_time=rt)
+        return Comparison(Category.RUST_TIMEOUT,
+                          note="rust timed out, java succeeded" if java_result.succeeded else "",
+                          java_time=jt, rust_time=rt)
 
     if java_result.crashed and rust_result.crashed:
         return Comparison(Category.BOTH_CRASH,
@@ -185,6 +180,16 @@ def compare(java_result: RunResult, rust_result: RunResult) -> Comparison:
         cat = Category.MINOR_DIFF
     else:
         cat = Category.MAJOR_DIFF
+
+    # Check for large runtime divergence even when outputs match.
+    # Use max/min ratio; guard against near-zero times.
+    if jt > 0.5 and rt > 0.5:
+        ratio = max(jt, rt) / min(jt, rt)
+        if ratio >= PERF_DIVERGE_RATIO:
+            slower = "java" if jt > rt else "rust"
+            return Comparison(Category.PERF_DIVERGE, diffs=diffs, max_rel_diff=max_rel,
+                              note=f"{slower} {ratio:.1f}x slower",
+                              java_time=jt, rust_time=rt)
 
     return Comparison(cat, diffs=diffs, max_rel_diff=max_rel,
                       java_time=jt, rust_time=rt)

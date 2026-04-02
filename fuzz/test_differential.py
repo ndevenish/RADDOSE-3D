@@ -44,8 +44,9 @@ FAIL_CATEGORIES = {
     Category.NAN_INF,
     Category.JAVA_CRASH,
     Category.RUST_CRASH,
-    # BOTH_CRASH means neither works — still worth surfacing
     Category.BOTH_CRASH,
+    Category.JAVA_TIMEOUT,   # one timed out, other succeeded
+    Category.RUST_TIMEOUT,
 }
 
 # Categories to skip (both timed out = bad budget, not a real failure)
