@@ -3,4 +3,4 @@
 	url = https://github.com/ndevenish/rustdose-3d.git
 [submodule "fuzz"]
 	path = fuzz
-	url = ./fuzz
+	url = https://github.com/ndevenish/rustdose-3d.git
